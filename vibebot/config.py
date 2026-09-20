@@ -22,6 +22,11 @@ class BrowserConfig:
     action_timeout_ms: int = 15000
     nav_timeout_ms: int = 30000
     locale: str = "en-US"
+    max_frames: int = 12
+    """Frames scanned per page (main document + iframes). Ad-heavy pages can
+    have dozens; each one costs a round trip."""
+    follow_new_tabs: bool = True
+    """Switch to a tab the page opens, the way a person would."""
 
 
 @dataclass
@@ -98,6 +103,9 @@ class ServerConfig:
     port: int = 8765
     token: str = ""
     """Set this (or VIBEBOT_TOKEN) before binding to 0.0.0.0 on a server."""
+    live_fps: float = 2.0
+    """Frame rate of the optional live view. Off until a viewer asks for it;
+    each frame is a full PNG screenshot, so this is not free."""
 
 
 @dataclass

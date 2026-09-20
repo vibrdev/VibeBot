@@ -56,6 +56,26 @@ that it is fully offline.
 **Web UI** (`python -m vibebot serve`) — type a goal, watch the annotated
 screenshots, see which layer made each decision, answer when it asks.
 
+### Watching it work
+
+Two ways, both optional:
+
+- **The browser window itself.** `headless: false` is the default, so on your PC
+  there is a real Chromium on screen doing the clicking. You can take over in it
+  at any time — the agent re-reads the page every step, so it just carries on
+  from wherever you left it.
+- **The Live button in the UI.** Streams the browser continuously instead of one
+  still per step, with a tab strip and a LIVE marker. Useful headless, on a
+  server, or when the agent is thinking and you want to see the page *now*.
+
+Live view is off until you press it, and stops when you press it again or close
+the tab — it is a full PNG per frame, so it is not free. `server.live_fps` sets
+the ceiling (2/s by default); what you actually get depends on how fast the
+machine can capture, typically 2–4/s.
+
+The stream is read-only. It cannot disturb a run, and it keeps updating while
+the agent is mid-decision, paused, or waiting on your answer.
+
 **Terminal** — for scripts and servers:
 
 ```bash
@@ -97,6 +117,20 @@ wanted, rather than a hard-coded rule.
 
 Because Laya cannot write text, "what should I type?" is also a multiple choice:
 two or three strings derived from your goal, or `ask_llm` if none fit.
+
+### Frames and tabs
+
+Cookie walls, checkouts and embedded search boxes live in iframes, so perception
+walks the main document **and every iframe** (up to `browser.max_frames`),
+handing out one flat set of indices. Element `[7]` is element `[7]` whether it
+sits in the page or three frames deep; the agent remembers which frame each one
+came from and clicks it there. Elements inside a frame are labelled
+`(iframe 2)` so both models know.
+
+Tabs work the way a person expects: a `target="_blank"` link or popup is
+followed automatically, and the agent can `switch_tab` and `close_tab`. The open
+tabs are listed to the LLM, and when exactly two are open "it's in the other
+tab" is a choice Laya can make by itself. It refuses to close the last tab.
 
 ### Tuning the gate
 
@@ -175,8 +209,9 @@ vibebot/
 ## Known limits
 
 - Single browser session per process; one goal at a time.
-- No `<iframe>` traversal yet — elements inside iframes are invisible to it.
-- Shadow DOM is only partly reachable.
+- Shadow DOM is only partly reachable (open roots via `[role=...]` only).
+- Cross-origin iframes are read through Playwright, so they work — but a frame
+  that navigates mid-step is skipped for that step rather than retried.
 - Zero-shot Laya is weak on unusual pages; the LLM carries those steps. The
   trace files exist so you can fix that with a fine-tune.
 

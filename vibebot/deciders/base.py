@@ -100,19 +100,24 @@ class Decider(Protocol):
 def build_state(goal: str, obs: Observation, history: list[str], text_budget: int = 600) -> dict[str, str]:
     """The 'state' blob Laya conditions on. Deliberately short — context is money."""
     recent = history[-4:]
-    return {
+    state = {
         "goal": goal,
         "page_title": obs.title[:120],
         "url": obs.url[:180],
         "steps_taken": "; ".join(recent) if recent else "none yet",
         "page_text": " ".join(obs.text_digest.split())[:text_budget],
     }
+    if len(obs.tabs) > 1:
+        state["open_tabs"] = " | ".join(tab.label(40) for tab in obs.tabs[:6])
+    return state
 
 
-def element_criteria(candidates: list[Element]) -> dict[str, str]:
+def element_criteria(candidates: list[Element], tab_count: int = 1) -> dict[str, str]:
     """Element list in Laya's `choice` criteria format, plus the escape hatches."""
     criteria = {f"e{el.idx}": el.label() for el in candidates}
     criteria.update(ESCAPE_OPTIONS)
+    if tab_count > 1:
+        criteria["switch_tab"] = "what we need is in one of the other open tabs"
     return criteria
 
 

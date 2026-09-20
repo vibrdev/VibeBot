@@ -9,6 +9,8 @@ browser:
   user_data_dir: ./.vibebot/profile   # logins persist here between runs
   start_url: about:blank
   locale: en-US
+  max_frames: 12           # main document + iframes scanned per page
+  follow_new_tabs: true    # jump to tabs the page opens, like a person would
 
 decider:
   backend: laya            # laya | jev | heuristic
@@ -53,5 +55,6 @@ server:
   host: 127.0.0.1
   port: 8765
   token: ""                # REQUIRED if you bind to 0.0.0.0 on a server
+  live_fps: 2.0            # optional live view; only runs while you watch
 
 trace_dir: ./.vibebot/traces

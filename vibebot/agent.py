@@ -145,6 +145,8 @@ class Agent:
                 title=obs.title,
                 candidates=[{"idx": el.idx, "label": el.label()} for el in candidates],
                 screenshot=_data_url(shot),
+                frames=1 + max((el.frame_id for el in obs.elements), default=0),
+                tabs=[{"index": t.index, "url": t.url, "active": t.active} for t in obs.tabs],
             )
 
             verdict = await self.decider.decide(
@@ -231,7 +233,22 @@ class Agent:
             )
             return await self._risk_gate(action, obs), None
 
-        # 3. Cheap navigation escapes — no need to wake the LLM for these.
+        # 3a. "It's in another tab." With exactly two open there is nothing to
+        #     reason about; with more, the LLM picks which one.
+        if verdict.target == "switch_tab" and confident and len(obs.tabs) == 2:
+            other = 1 - obs.active_tab
+            return (
+                Action(
+                    op="switch_tab",
+                    text=str(other),
+                    reason=f"laya p={verdict.p_top:.0%}",
+                    source="laya",
+                    confidence=verdict.p_top,
+                ),
+                None,
+            )
+
+        # 3b. Cheap navigation escapes — no need to wake the LLM for these.
         if verdict.target in {"scroll", "back"} and confident:
             return (
                 Action(
@@ -342,6 +359,10 @@ class Agent:
                 return await self.browser.back()
             if action.op == "wait":
                 return await self.browser.wait(float(action.text or 1))
+            if action.op == "switch_tab":
+                return await self.browser.switch_tab(_as_index(action.text, obs.active_tab))
+            if action.op == "close_tab":
+                return await self.browser.close_tab(_as_index(action.text, obs.active_tab))
             return f"no-op ({action.op})"
         except Exception as exc:  # noqa: BLE001 - a failed action is data, not a crash
             log.warning("action failed: %s", exc)
@@ -424,6 +445,14 @@ class Agent:
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         trace.write({"type": "step", **record.to_json()})
+
+
+def _as_index(text: str, fallback: int) -> int:
+    """Tab index out of whatever the model put in `text` ("2", "tab 2", "")."""
+    import re
+
+    match = re.search(r"-?\d+", text or "")
+    return int(match.group()) if match else fallback
 
 
 def _from_llm(decision) -> Action:  # noqa: ANN001

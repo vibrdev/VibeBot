@@ -87,7 +87,7 @@ class LayaDecider:
             return Verdict(target="ask_llm", backend="laya-unavailable")
 
         state = build_state(goal, obs, history, self.cfg.page_text_chars)
-        questions = self._questions(candidates, text_options)
+        questions = self._questions(candidates, text_options, len(obs.tabs))
 
         started = time.perf_counter()
         try:
@@ -122,7 +122,9 @@ class LayaDecider:
 
     # ---------------------------------------------------------------- helpers
 
-    def _questions(self, candidates: list[Element], text_options: list[str]) -> dict[str, Any]:
+    def _questions(
+        self, candidates: list[Element], text_options: list[str], tab_count: int = 1
+    ) -> dict[str, Any]:
         questions: dict[str, Any] = {
             "target": {
                 "type": "choice",
@@ -130,7 +132,7 @@ class LayaDecider:
                     "Given the goal and the current page, which single element should be "
                     "acted on next? Pick 'ask_llm' if the choice needs real reasoning."
                 ),
-                "criteria": element_criteria(candidates),
+                "criteria": element_criteria(candidates, tab_count),
             },
             "operation": {
                 "type": "choice",

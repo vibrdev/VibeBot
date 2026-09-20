@@ -8,11 +8,14 @@ from typing import Any, Literal
 
 Op = Literal[
     "click", "type", "select", "scroll", "navigate", "back",
-    "wait", "extract", "ask_user", "done", "fail",
+    "wait", "extract", "switch_tab", "close_tab", "ask_user", "done", "fail",
 ]
 
 #: Ops that do not need a target element.
-GLOBAL_OPS = {"scroll", "navigate", "back", "wait", "extract", "ask_user", "done", "fail"}
+GLOBAL_OPS = {
+    "scroll", "navigate", "back", "wait", "extract",
+    "switch_tab", "close_tab", "ask_user", "done", "fail",
+}
 
 #: Ops that end the run.
 TERMINAL_OPS = {"done", "extract", "fail"}
@@ -33,6 +36,8 @@ class Element:
     input_type: str = ""
     rect: tuple[float, float, float, float] = (0, 0, 0, 0)
     in_viewport: bool = True
+    frame_id: int = 0
+    """0 is the page itself; anything higher is an iframe."""
 
     def label(self, limit: int = 90) -> str:
         """Short human/model readable description. Kept tight on purpose: Laya has
@@ -43,9 +48,23 @@ class Element:
             parts.append(f'"{_squash(body, limit)}"')
         if self.input_type and self.input_type not in {"text", "submit"}:
             parts.append(f"[{self.input_type}]")
+        if self.frame_id:
+            parts.append(f"(iframe {self.frame_id})")
         if not self.in_viewport:
             parts.append("(offscreen)")
         return " ".join(parts)
+
+
+@dataclass
+class TabInfo:
+    index: int
+    url: str
+    title: str = ""
+    active: bool = False
+
+    def label(self, limit: int = 70) -> str:
+        mark = "*" if self.active else " "
+        return f"{mark}[{self.index}] {_squash(self.title or self.url, limit)}"
 
 
 @dataclass
@@ -59,6 +78,8 @@ class Observation:
     screenshot_png: bytes | None = None
     annotated_png: bytes | None = None
     step: int = 0
+    tabs: list[TabInfo] = field(default_factory=list)
+    active_tab: int = 0
 
     def fingerprint(self) -> str:
         import hashlib

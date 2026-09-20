@@ -12,19 +12,23 @@ from playwright.async_api import (
     Browser,
     BrowserContext,
     Error as PlaywrightError,
+    Frame,
     Page,
     async_playwright,
 )
 
 from .config import BrowserConfig
-from .schema import Element, Observation
+from .schema import Element, Observation, TabInfo
 
 log = logging.getLogger(__name__)
 
-#: Runs in the page. Tags every interactive element with data-vb-idx and returns
-#: a compact description of each, plus a text digest of the visible page.
+#: Runs inside one frame. Tags every interactive element with data-vb-idx and
+#: returns a compact description of each, plus a text digest.
+#:
+#: Indices are allocated from `offset` so that elements from the main document
+#: and from every nested iframe share one flat, unambiguous numbering.
 _COLLECT_JS = r"""
-(maxElements) => {
+({ maxElements, offset }) => {
   const SELECTOR = [
     'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
     '[role=button]', '[role=link]', '[role=checkbox]', '[role=radio]',
@@ -58,7 +62,7 @@ _COLLECT_JS = r"""
   document.querySelectorAll('[data-vb-idx]').forEach(el => el.removeAttribute('data-vb-idx'));
 
   const out = [];
-  let idx = 0;
+  let idx = offset;
   for (const el of document.querySelectorAll(SELECTOR)) {
     if (out.length >= maxElements) break;
     const rect = el.getBoundingClientRect();
@@ -96,6 +100,8 @@ _COLLECT_JS = r"""
 """
 
 #: Draws numbered boxes so a vision model can map what it sees to an index.
+#: Injected per frame, so boxes for elements inside an iframe are drawn by that
+#: iframe and land in the right place on the page screenshot.
 _ANNOTATE_JS = r"""
 (indices) => {
   const wanted = new Set(indices.map(String));
@@ -143,6 +149,9 @@ class BrowserSession:
         self._browser: Browser | None = None
         self._ctx: BrowserContext | None = None
         self.page: Page | None = None
+        #: Element index -> the frame that owns it. Rebuilt on every observe().
+        self._frames: dict[int, Frame] = {}
+        self._active_tab = 0
 
     async def start(self) -> None:
         headless = self.cfg.headless or _no_display()
@@ -168,8 +177,20 @@ class BrowserSession:
         self._ctx.set_default_timeout(self.cfg.action_timeout_ms)
         self._ctx.set_default_navigation_timeout(self.cfg.nav_timeout_ms)
         self.page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
+
+        if self.cfg.follow_new_tabs:
+            # Links with target=_blank and popups open a new page; follow it the
+            # way a person would, instead of quietly staring at the old tab.
+            self._ctx.on("page", self._on_new_page)
+
         if self.cfg.start_url and self.cfg.start_url != "about:blank":
             await self.goto(self.cfg.start_url)
+
+    def _on_new_page(self, page: Page) -> None:
+        if self._ctx:
+            self._active_tab = len(self._ctx.pages) - 1
+        self.page = page
+        log.info("new tab opened: %s", page.url)
 
     async def close(self) -> None:
         for closer in (self._ctx, self._browser):
@@ -191,45 +212,97 @@ class BrowserSession:
             pass
         await asyncio.sleep(0.25)  # let late-rendering frameworks settle
 
-        raw = await page.evaluate(_COLLECT_JS, max_elements)
-        elements = [
-            Element(
-                idx=item["idx"],
-                tag=item["tag"],
-                role=item["role"],
-                text=item["text"],
-                name=item["name"],
-                placeholder=item["placeholder"],
-                value=item["value"],
-                href=item["href"],
-                input_type=item["input_type"],
-                rect=tuple(item["rect"]),
-                in_viewport=item["in_viewport"],
-            )
-            for item in raw["elements"]
-        ]
+        self._frames = {}
+        elements: list[Element] = []
+        texts: list[str] = []
+        url, title = page.url, ""
+
+        for frame_id, frame in enumerate(self._collectable_frames(page)):
+            budget = max_elements - len(elements)
+            if budget <= 0:
+                break
+            try:
+                raw = await frame.evaluate(_COLLECT_JS, {"maxElements": budget, "offset": len(elements)})
+            except PlaywrightError as exc:
+                # Frames detach and navigate mid-walk; that is normal, not fatal.
+                log.debug("frame %s not readable: %s", frame_id, exc)
+                continue
+
+            if frame_id == 0:
+                url, title = raw["url"], raw["title"]
+                texts.append(raw["text"])
+            elif raw["text"]:
+                texts.append(f"[iframe {frame_id}] " + raw["text"][:800])
+
+            for item in raw["elements"]:
+                self._frames[item["idx"]] = frame
+                elements.append(
+                    Element(
+                        idx=item["idx"],
+                        tag=item["tag"],
+                        role=item["role"],
+                        text=item["text"],
+                        name=item["name"],
+                        placeholder=item["placeholder"],
+                        value=item["value"],
+                        href=item["href"],
+                        input_type=item["input_type"],
+                        rect=tuple(item["rect"]),
+                        in_viewport=item["in_viewport"],
+                        frame_id=frame_id,
+                    )
+                )
+
         shot = await self.screenshot() if screenshot else None
         return Observation(
-            url=raw["url"],
-            title=raw["title"],
+            url=url,
+            title=title,
             elements=elements,
-            text_digest=raw["text"],
+            text_digest=" ".join(texts),
             screenshot_png=shot,
+            tabs=self.tabs(),
+            active_tab=self._active_tab,
         )
+
+    def _collectable_frames(self, page: Page) -> list[Frame]:
+        """Main frame first, then iframes. Detached and blank frames are dropped."""
+        frames = []
+        for frame in page.frames:
+            if frame.is_detached():
+                continue
+            if frame is not page.main_frame and frame.url in {"", "about:blank"}:
+                continue
+            frames.append(frame)
+        return frames[: self.cfg.max_frames]
 
     async def screenshot(self, highlight: list[int] | None = None) -> bytes | None:
         page = self._live_page()
+        annotated: list[Frame] = []
         try:
             if highlight is not None:
-                await page.evaluate(_ANNOTATE_JS, highlight)
+                # Each frame draws its own boxes; coordinates are frame-local.
+                by_frame: dict[int, list[int]] = {}
+                for idx in highlight:
+                    frame = self._frames.get(idx)
+                    if frame is not None:
+                        by_frame.setdefault(id(frame), []).append(idx)
+                for frame in self._collectable_frames(page):
+                    indices = by_frame.get(id(frame))
+                    if not indices:
+                        continue
+                    try:
+                        await frame.evaluate(_ANNOTATE_JS, indices)
+                        annotated.append(frame)
+                    except PlaywrightError:
+                        continue
             return await page.screenshot(type="png", full_page=False)
         except PlaywrightError as exc:
             log.warning("screenshot failed: %s", exc)
             return None
         finally:
-            if highlight is not None:
+            for frame in annotated:
                 try:
-                    await page.evaluate(_DEANNOTATE_JS)
+                    await frame.evaluate(_DEANNOTATE_JS)
                 except PlaywrightError:
                     pass
 
@@ -298,6 +371,56 @@ class BrowserSession:
         await asyncio.sleep(min(seconds, 10))
         return f"waited {seconds}s"
 
+    # ------------------------------------------------------------------ tabs
+
+    def tabs(self) -> list[TabInfo]:
+        """Cheap listing. Page.title() is async, so titles are left to
+        :meth:`tabs_detailed`; the URL is enough to tell tabs apart."""
+        if not self._ctx:
+            return []
+        return [
+            TabInfo(index=i, title="", url=page.url, active=i == self._active_tab)
+            for i, page in enumerate(self._ctx.pages)
+        ]
+
+    async def tabs_detailed(self) -> list[TabInfo]:
+        """Same as tabs() but pays a round trip per tab for the real titles."""
+        if not self._ctx:
+            return []
+        out = []
+        for i, page in enumerate(self._ctx.pages):
+            try:
+                title = await page.title()
+            except PlaywrightError:
+                title = ""
+            out.append(TabInfo(index=i, title=title, url=page.url, active=i == self._active_tab))
+        return out
+
+    async def switch_tab(self, index: int) -> str:
+        if not self._ctx:
+            raise RuntimeError("browser session not started")
+        pages = self._ctx.pages
+        if not 0 <= index < len(pages):
+            return f"FAILED: no tab {index} (there are {len(pages)})"
+        self._active_tab = index
+        self.page = pages[index]
+        await self.page.bring_to_front()
+        await self._settle()
+        return f"switched to tab {index} ({self.page.url[:80]})"
+
+    async def close_tab(self, index: int | None = None) -> str:
+        if not self._ctx:
+            raise RuntimeError("browser session not started")
+        pages = self._ctx.pages
+        target = self._active_tab if index is None else index
+        if not 0 <= target < len(pages) or len(pages) == 1:
+            return f"FAILED: refusing to close tab {target} of {len(pages)}"
+        await pages[target].close()
+        remaining = self._ctx.pages
+        self._active_tab = min(target, len(remaining) - 1)
+        self.page = remaining[self._active_tab]
+        return f"closed tab {target}, now on tab {self._active_tab}"
+
     async def element_is_password(self, idx: int) -> bool:
         try:
             handle = self._by_idx(idx)
@@ -308,14 +431,24 @@ class BrowserSession:
     # ---------------------------------------------------------------- helpers
 
     def _live_page(self) -> Page:
-        if self._ctx and self._ctx.pages:
-            # A click may have opened a new tab; always act on the newest one.
-            self.page = self._ctx.pages[-1]
-        if self.page is None:
-            raise RuntimeError("browser session not started")
+        """The tab we are acting on, repaired if it was closed under us."""
+        if not self._ctx or not self._ctx.pages:
+            if self.page is None:
+                raise RuntimeError("browser session not started")
+            return self.page
+        pages = self._ctx.pages
+        if self.page is None or self.page.is_closed() or self.page not in pages:
+            self._active_tab = min(self._active_tab, len(pages) - 1)
+            self.page = pages[self._active_tab]
+        else:
+            self._active_tab = pages.index(self.page)
         return self.page
 
     def _by_idx(self, idx: int):
+        """Locate an element in whichever frame it was found in."""
+        frame = self._frames.get(idx)
+        if frame is not None and not frame.is_detached():
+            return frame.locator(f'[data-vb-idx="{idx}"]').first
         return self._live_page().locator(f'[data-vb-idx="{idx}"]').first
 
     async def _settle(self) -> None:

@@ -24,9 +24,9 @@ elements, and (when available) a screenshot with those numbers drawn on it.
 Reply with ONE JSON object and nothing else:
 
 {
-  "op": "click|type|select|scroll|navigate|back|wait|extract|ask_user|done|fail",
+  "op": "click|type|select|scroll|navigate|back|wait|extract|switch_tab|close_tab|ask_user|done|fail",
   "element_idx": <number from the list, or null>,
-  "text": "<text to type / option to select / url / question for the user / final answer>",
+  "text": "<text to type / option to select / url / tab number / question / final answer>",
   "reason": "<one short sentence>",
   "confidence": <0.0-1.0>
 }
@@ -34,6 +34,10 @@ Reply with ONE JSON object and nothing else:
 Rules:
 - Only use element_idx values that appear in the list.
 - "type" needs both element_idx and text. It submits with Enter afterwards.
+- Elements marked "(iframe N)" live inside an embedded frame. Act on them
+  normally — the index is all you need.
+- "switch_tab" / "close_tab" take the tab number in "text". The agent already
+  follows tabs the page opens, so switch only to go back to an earlier one.
 - "extract" means the goal was an information request: put the answer in "text".
 - "done" means the goal is finished: put a short result summary in "text".
 - "ask_user" is for missing information only you cannot invent (which account,
@@ -84,9 +88,11 @@ def render_prompt(
         "",
         f"PAGE: {obs.title}",
         f"URL: {obs.url}",
-        "",
-        "ELEMENTS:",
     ]
+    if len(obs.tabs) > 1:
+        lines += ["", f"TABS ({len(obs.tabs)} open, * = current):"]
+        lines += [f"  {tab.label()}" for tab in obs.tabs]
+    lines += ["", "ELEMENTS:"]
     lines += [f"  [{el.idx}] {el.label(110)}" for el in candidates]
     lines += [
         "",
