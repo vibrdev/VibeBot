@@ -24,7 +24,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, unquote_plus, urlparse, urlsplit, urlunsplit
 
 from .browser import BrowserSession
 from .config import Config
@@ -59,6 +59,10 @@ class Agent:
         #: Every LLM exchange in the current step, so the trace can show what
         #: the model was asked and what it actually replied.
         self._step_llm: list[dict[str, Any]] = []
+        #: Every question put to you in the current step, and your answer.
+        #: Without this a run you sat and approved reads back as though you
+        #: were never there.
+        self._step_asks: list[dict[str, Any]] = []
         #: (url, op, element) triples Laya has already been allowed to try on
         #: this run. Laya has no memory between steps, so an exact repeat means
         #: a loop, not a decision: real runs clicked eBay's "Deals" six times
@@ -172,6 +176,7 @@ class Agent:
 
             started = time.perf_counter()
             self._step_llm = []
+            self._step_asks = []
             obs = await self.browser.observe()
             obs.step = step
 
@@ -217,11 +222,12 @@ class Agent:
             before = obs.fingerprint()
             outcome = await self._execute(action, obs)
             if action.source == "laya":
-                self._tried.add((obs.url, action.op, action.element_idx))
+                self._tried.add((_page_key(obs.url), action.op, action.element_idx))
             if action.op == "scroll":
-                self._scrolls[obs.url] = self._scrolls.get(obs.url, 0) + 1
+                key = _page_key(obs.url)
+                self._scrolls[key] = self._scrolls.get(key, 0) + 1
             else:
-                self._scrolls.pop(obs.url, None)
+                self._scrolls.pop(_page_key(obs.url), None)
             await self.emit("acted", step=step, action=action.describe(obs), outcome=outcome, source=action.source)
             self._history.append(f"{action.describe(obs)} -> {outcome}")
             self._record(trace, step, obs, candidates, verdict, action, outcome, escalated, started)
@@ -232,7 +238,13 @@ class Agent:
             if action.source in {"llm", "user"} and host:
                 # Wherever you or the LLM deliberately went is the task's site.
                 self._task_host = host
-            elif action.source == "laya" and host and self._task_host and host != self._task_host:
+            elif (
+                action.source == "laya"
+                and host
+                and self._task_host
+                and host != self._task_host
+                and not _is_search_host(self._task_host)
+            ):
                 # Measured: on Wikipedia's front page Laya clicked a photo
                 # caption at p=0.74, then its licence link at p=0.97, and the
                 # run was on creativecommons.org two steps from the goal.
@@ -247,7 +259,7 @@ class Agent:
                 # Succeeding and achieving nothing is its own kind of dead end:
                 # clicking the link for the page you are already on returns
                 # "clicked element 3" forever. Bar it whoever chose it.
-                self._tried.add((obs.url, action.op, action.element_idx))
+                self._tried.add((_page_key(obs.url), action.op, action.element_idx))
                 stalls += 1
                 if stalls >= policy.stall_limit * 2:
                     answer = await self.ask_user(
@@ -290,7 +302,7 @@ class Agent:
 
         # 1. Laya thinks we are finished. Cheap to check, expensive to get wrong,
         #    so have the LLM confirm before we celebrate.
-        if verdict.done_p >= cfg.done_confidence and obs.url not in self._not_done:
+        if verdict.done_p >= cfg.done_confidence and _page_key(obs.url) not in self._not_done:
             # Leading the witness here gets you agreement, not a check. Asked
             # to "confirm with done", qwen3.5:4b ended a run on a page of
             # Google results with "Goal confirmed: Found search results for
@@ -309,7 +321,7 @@ class Agent:
             )
             if confirmed.op in TERMINAL_OPS - {"fail"}:
                 return _from_llm(confirmed), "llm"
-            self._not_done.add(obs.url)
+            self._not_done.add(_page_key(obs.url))
             # It declined to call it finished and named something else to do.
             # Falling through to Laya's guess here threw that away and acted on
             # the worse-informed of the two: on a page of search results, Laya
@@ -332,7 +344,7 @@ class Agent:
             op, needs_llm = _coerce_operation(verdict.operation, element, verdict.text)
             if needs_llm:
                 return await self._llm_step(obs, candidates, needs_llm)
-            if (obs.url, op, element.idx) in self._tried:
+            if (_page_key(obs.url), op, element.idx) in self._tried:
                 return await self._llm_step(
                     obs,
                     candidates,
@@ -378,7 +390,7 @@ class Agent:
                     "Laya wants to go back, but this page was chosen deliberately one "
                     "step ago. Work with what is on it.",
                 )
-            if (obs.url, verdict.target, None) in self._tried:
+            if (_page_key(obs.url), verdict.target, None) in self._tried:
                 return await self._llm_step(
                     obs,
                     candidates,
@@ -397,17 +409,25 @@ class Agent:
             )
 
         # 4. Everything else is the LLM's problem.
-        note = (
-            "Laya deferred this step to you."
-            if verdict.wants_llm
-            else (
+        if verdict.wants_llm:
+            note = "Laya deferred this step to you."
+        elif verdict.target == "done":
+            # Reporting p=98% as "below the acceptance gate" was simply false:
+            # the gate never looked at it, because this page had already been
+            # asked about and the answer was no.
+            note = (
+                f"Laya says the goal is met ({verdict.p_top:.0%}), but you have already "
+                "been asked about this page and said it is not finished. Do not answer "
+                "again — choose the action that gets closer."
+            )
+        else:
+            note = (
                 f"Laya's best guess was {verdict.target} at p={verdict.p_top:.0%} "
                 f"(margin {verdict.margin:.0%}) — below the acceptance gate."
             )
-        )
         if stalls >= self.cfg.policy.stall_limit:
             note += " The last few actions did not change the page; try something different."
-        scrolls = self._scrolls.get(obs.url, 0)
+        scrolls = self._scrolls.get(_page_key(obs.url), 0)
         if scrolls >= 3:
             # Told firmly enough not to answer without the value, the model
             # scrolled the same results page six times instead.
@@ -550,6 +570,7 @@ class Agent:
         finally:
             self._answer = None
         await self.emit("answer", answer=answer)
+        self._step_asks.append({"question": question, "answer": answer})
         return answer
 
     def provide_answer(self, answer: str) -> bool:
@@ -618,8 +639,42 @@ class Agent:
         payload["llm_calls"] = [
             {k: v for k, v in call.items() if k != "prompt"} for call in self._step_llm
         ]
+        payload["asked_you"] = list(self._step_asks)
         trace.write({"type": "step", **payload})
         trace.step_note(payload, self._step_llm)
+
+
+#: Hosts that are a waypoint rather than a destination. Clicking through to
+#: somewhere else is the whole point of being on one, so leaving is not drift.
+SEARCH_HOSTS = (
+    "google.", "bing.", "duckduckgo.", "ecosia.", "startpage.", "yahoo.",
+    "search.brave.", "qwant.", "baidu.", "yandex.",
+)
+
+
+def _page_key(url: str) -> str:
+    """One key per page, whatever spelling the site hands back.
+
+    Wikipedia served `title=Special:Search` and `title=Special%3ASearch` for
+    the same results page two steps apart. Keyed on the raw string, the loop
+    guard saw two different pages and let Laya bounce between that page and a
+    red link for the rest of the run.
+    """
+    parts = urlsplit(url or "")
+    return urlunsplit(
+        (
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            unquote(parts.path),
+            unquote_plus(parts.query),
+            "",  # a fragment is the same page
+        )
+    )
+
+
+def _is_search_host(host: str) -> bool:
+    host = (host or "").lower()
+    return any(mark in host for mark in SEARCH_HOSTS)
 
 
 def _offtopic_and_unsure(element, terms: set[str], p_top: float, trust: float) -> bool:  # noqa: ANN001
