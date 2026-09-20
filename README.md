@@ -44,7 +44,7 @@ pip install laya                 # the decision model (pulls torch, ~2.5 GB)
 
 # the reasoning model
 winget install Ollama.Ollama
-ollama pull qwen2.5vl:7b         # or qwen2.5vl:3b on a weak machine
+ollama pull qwen3-vl:8b          # 6.1 GB; see "Choosing the LLM" below
 
 copy config.example.yaml config.yaml
 python -m vibebot doctor         # checks all four pieces
@@ -136,6 +136,29 @@ Tabs work the way a person expects: a `target="_blank"` link or popup is
 followed automatically, and the agent can `switch_tab` and `close_tab`. The open
 tabs are listed to the LLM, and when exactly two are open "it's in the other
 tab" is a choice Laya can make by itself. It refuses to close the last tab.
+
+### Choosing the LLM
+
+| Tag | Download | Fits | Notes |
+|---|---|---|---|
+| `qwen3-vl:8b` | 6.1 GB | 12 GB VRAM | the default |
+| `qwen3-vl:4b` | 3.3 GB | 8 GB VRAM | the sweet spot on a laptop |
+| `qwen3-vl:2b` | 1.9 GB | 4 GB VRAM | last resort; expect more `ask_user` |
+
+Set `llm.model` to anything Ollama serves, or point `llm.backend: openai` at a
+hosted endpoint. Whatever you pick needs **vision**, or set `llm.vision: false`
+and it runs on the element list alone (worse, but it works).
+
+One expectation to set: a newer VLM helps less here than the benchmarks imply.
+The model is never asked to *find* anything on screen — it gets a numbered
+element list and a screenshot with those numbers drawn on it, so the grounding
+ability those scores measure is work the DOM layer already did. What matters is
+instruction-following and sticking to JSON. Judge a swap by how often runs end
+in `ask_user`, not by leaderboard position.
+
+Nothing in this table has been benchmarked inside this repo. The traces in
+`.vibebot/traces/` are how you settle it on your own sites: same goal, two
+models, compare escalations and failures.
 
 ### Tuning the gate
 

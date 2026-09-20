@@ -65,7 +65,11 @@ class DeciderConfig:
 class LLMConfig:
     backend: str = "ollama"
     """ollama | openai | none"""
-    model: str = "qwen2.5vl:7b"
+    model: str = "qwen3-vl:8b"
+    """Any vision model Ollama serves. qwen3-vl is the current default because
+    its family is the documented one for GUI-agent work; not benchmarked in this
+    repo, so treat it as a sane starting point rather than a measured winner.
+    Drop to qwen3-vl:4b on 8 GB of VRAM, or :2b on less."""
     base_url: str = "http://127.0.0.1:11434"
     api_key_env: str = "OPENAI_API_KEY"
     vision: bool = True
