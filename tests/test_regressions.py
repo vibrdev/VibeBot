@@ -151,3 +151,57 @@ def test_on_topic_and_navigational_picks_are_plausible():
     ebay = goal_terms(EBAY_GOAL, EBAY_URL)
     assert is_plausible(Element(idx=3, tag="a", text="Apple MacBook Pro M4 14-inch"), ebay)
     assert is_plausible(Element(idx=4, tag="button", text="Next"), ebay)
+
+
+# ------------------------------------------------------------ start / stop
+
+import os  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from vibebot.config import Config  # noqa: E402
+from vibebot.server import _pid_file  # noqa: E402
+
+
+def test_pid_file_written_while_running_and_removed_after(tmp_path):
+    """`Stop VibeBot` finds the server through this file."""
+    target = tmp_path / "nested" / "server.pid"
+    with _pid_file(str(target)):
+        assert target.read_text(encoding="ascii") == str(os.getpid())
+    assert not target.exists()
+
+
+def test_pid_file_survives_an_unwritable_path(tmp_path):
+    """A pid file that cannot be written is not a reason to refuse to start."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="ascii")
+    with _pid_file(str(blocker / "server.pid")):
+        pass  # must not raise
+
+
+def test_pid_file_removed_even_if_the_server_raises(tmp_path):
+    target = tmp_path / "server.pid"
+    try:
+        with _pid_file(str(target)):
+            raise RuntimeError("server crashed")
+    except RuntimeError:
+        pass
+    assert not target.exists()
+
+
+def test_launcher_scripts_are_double_clickable():
+    """Batch files need CRLF, and must not have picked up stray control
+    characters - an earlier pass turned \taskkill into a literal tab."""
+    root = Path(__file__).resolve().parent.parent
+    for name in ("VibeBot.cmd", "Stop VibeBot.cmd"):
+        raw = (root / name).read_bytes()
+        assert raw, f"{name} is empty"
+        assert b"\r\n" in raw, f"{name} needs CRLF line endings"
+        assert b"\t" not in raw, f"{name} contains a tab"
+        assert b"\f" not in raw, f"{name} contains a form feed"
+        raw.decode("ascii")  # non-ASCII breaks on other code pages
+
+
+def test_server_defaults_are_one_double_click():
+    cfg = Config()
+    assert cfg.server.open_browser is True
+    assert cfg.server.pid_file.endswith("server.pid")
