@@ -31,6 +31,16 @@
     padding: 9px 16px; font: 600 14px/1 inherit; cursor: pointer;
   }
   button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  button.danger { border-color: #5b2330; color: #f0a0ad; }
+  button.danger:hover { background: #2a1219; color: #ffd7de; }
+  header .spacer { flex: 0 0 8px; border-left: 1px solid var(--line); height: 22px; }
+  #shade {
+    position: fixed; inset: 0; display: none; place-items: center; z-index: 50;
+    background: rgba(5, 7, 10, .93); text-align: center; padding: 24px;
+  }
+  #shade.show { display: grid; }
+  #shade h2 { margin: 0 0 8px; font-size: 20px; }
+  #shade p { margin: 0; color: var(--muted); font-size: 14px; }
   button:disabled { opacity: .45; cursor: not-allowed; }
   main { flex: 1; display: grid; grid-template-columns: 1fr 420px; min-height: 0; }
   #stage { position: relative; background: #05070a; display: grid; place-items: center; overflow: hidden; }
@@ -92,8 +102,17 @@
   <button id="go">Run</button>
   <button id="live" class="ghost" title="Stream the browser continuously instead of once per step">Live ○</button>
   <button id="pause" class="ghost">Pause</button>
-  <button id="stop" class="ghost">Stop</button>
+  <button id="stop" class="ghost" title="Stop the current goal (VibeBot keeps running)">Stop</button>
+  <span class="spacer"></span>
+  <button id="quit" class="ghost danger" title="Shut VibeBot down and close the browser it drives">Quit</button>
 </header>
+
+<div id="shade">
+  <div>
+    <h2>VibeBot has shut down</h2>
+    <p>You can close this tab. Start it again with <b>VibeBot</b> in the project folder.</p>
+  </div>
+</div>
 
 <main>
   <div id="stage">
@@ -143,10 +162,20 @@ function add(kind, title, sub, ratio) {
 }
 const esc = (s) => String(s ?? '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
 
+let quitting = false;
+
+function showShutdown() {
+  $('shade').classList.add('show');
+  $('foot').textContent = 'stopped';
+}
+
 function connect() {
   socket = new WebSocket(wsUrl);
   socket.onopen = () => { retry = 0; $('p-conn').textContent = 'connected'; };
   socket.onclose = () => {
+    // After a Quit the server is gone on purpose; reconnecting would just
+    // hammer a dead port and hide the notice.
+    if (quitting) { showShutdown(); return; }
     $('p-conn').textContent = 'disconnected';
     setTimeout(connect, Math.min(5000, 400 * ++retry));
   };
@@ -159,6 +188,7 @@ function connect() {
 
 function handle(e) {
   switch (e.type) {
+    case 'quitting': quitting = true; showShutdown(); break;
     case 'status':
       $('p-decider').textContent = 'decider: ' + e.decider;
       $('p-llm').textContent = 'llm: ' + e.llm + (e.llm_ready ? '' : ' ⚠');
@@ -229,6 +259,15 @@ const send = (obj) => socket && socket.readyState === 1 && socket.send(JSON.stri
 $('go').onclick = () => { const g = $('goal').value.trim(); if (g) { feed.innerHTML = ''; send({ type: 'run', goal: g }); } };
 $('goal').onkeydown = (e) => { if (e.key === 'Enter') $('go').click(); };
 $('stop').onclick = () => send({ type: 'stop' });
+$('quit').onclick = () => {
+  if (!confirm('Shut VibeBot down completely?
+
+This closes the browser it drives and stops the server.')) return;
+  quitting = true;
+  send({ type: 'quit' });
+  // The socket dies with the server, so show the notice either way.
+  setTimeout(showShutdown, 1200);
+};
 $('live').onclick = () => send({ type: 'live', value: !liveOn });
 let paused = false;
 $('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; send({ type: 'pause', value: paused }); };

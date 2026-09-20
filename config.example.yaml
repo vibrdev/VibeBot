@@ -78,5 +78,8 @@ server:
   port: 8765
   token: ""                # REQUIRED if you bind to 0.0.0.0 on a server
   live_fps: 2.0            # optional live view; only runs while you watch
+  open_browser: true       # open the UI when the server is ready, so starting
+                           # VibeBot is one double-click and no copied URLs
+  pid_file: ./.vibebot/server.pid   # how "Stop VibeBot" finds the running server
 
 trace_dir: ./.vibebot/traces

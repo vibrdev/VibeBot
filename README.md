@@ -22,7 +22,31 @@ hosted LLMs are supported but off by default.
 
 ---
 
+## Starting and stopping it
+
+Double-click **`VibeBot`** in the project folder. It sets itself up the first
+time (virtual environment, packages, Chromium — a few minutes), then starts and
+opens the UI in your browser. Every run after that takes seconds.
+
+To stop it, any of these:
+
+- press **Quit** in the page — closes the browser VibeBot drives, releases the
+  language model, and shuts the server down;
+- double-click **`Stop VibeBot`** — asks the server to close politely, and only
+  ends the process if it will not;
+- close the console window.
+
+**Quit** and **Stop** are different buttons on purpose: *Stop* ends the current
+goal and leaves VibeBot running for the next one, *Quit* shuts the whole thing
+down.
+
+Prefer a terminal, or on Linux/macOS, `python -m vibebot serve` still does the
+same thing; `server.open_browser: false` turns the automatic tab off.
+
 ## Quickstart (Windows)
+
+The double-click launcher above does all of this for you. Here it is by hand,
+for when you want to pin a Python version or install pieces separately.
 
 Python **3.10 – 3.13**. 3.11, 3.12 and 3.13 are tested end to end, including the
 real Laya weights; 3.10 is the floor and runs the app but was not exercised with
@@ -48,7 +72,7 @@ ollama pull qwen3.5:4b           # 3.4 GB; see "Choosing the LLM" below
 
 copy config.example.yaml config.yaml
 python -m vibebot doctor         # checks all four pieces
-python -m vibebot serve          # then open http://127.0.0.1:8765
+python -m vibebot serve          # opens http://127.0.0.1:8765 for you
 ```
 
 Linux/macOS is the same with `python3 -m venv .venv && source .venv/bin/activate`.

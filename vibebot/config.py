@@ -178,6 +178,12 @@ class ServerConfig:
     live_fps: float = 2.0
     """Frame rate of the optional live view. Off until a viewer asks for it;
     each frame is a full PNG screenshot, so this is not free."""
+    open_browser: bool = True
+    """Open the UI in your default browser once the server is listening, so
+    starting VibeBot is one double-click and no copying URLs out of a console."""
+    pid_file: str = "./.vibebot/server.pid"
+    """Where the running server records its PID, so `Stop VibeBot` can find it
+    without you hunting through Task Manager. Removed on a clean exit."""
 
 
 @dataclass

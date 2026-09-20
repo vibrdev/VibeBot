@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
+import socket
+import threading
 import time
+import webbrowser
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .agent import Agent
@@ -117,6 +122,26 @@ def create_app(cfg: Config) -> FastAPI:
             }
         )
 
+    async def do_quit() -> None:
+        """Bring the whole thing down tidily: stop the run, close Chromium,
+        release the model, then let uvicorn exit."""
+        await hub.publish({"type": "quitting"})
+        agent.stop()
+        task = state.get("task")
+        if task:
+            task.cancel()
+        request_shutdown = getattr(app.state, "request_shutdown", None)
+        if request_shutdown:
+            request_shutdown()
+
+    @app.post("/api/quit")
+    async def quit_endpoint(request: Request) -> JSONResponse:
+        """So `Stop VibeBot` can ask politely before it reaches for taskkill."""
+        if token and not secrets.compare_digest(request.query_params.get("token", ""), token):
+            return JSONResponse({"error": "bad token"}, status_code=401)
+        await do_quit()
+        return JSONResponse({"stopping": True})
+
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         agent.stop()
@@ -182,6 +207,10 @@ def create_app(cfg: Config) -> FastAPI:
         elif kind == "goto":
             await agent.browser.goto(str(message.get("url", "")))
             await hub.publish({"type": "log", "message": f"opened {message.get('url')}"})
+        elif kind == "quit":
+            # Closing VibeBot from the thing you are already looking at, rather
+            # than hunting for the console window it was started from.
+            await do_quit()
 
     return app
 
@@ -217,6 +246,83 @@ def serve(cfg: Config) -> None:
             "Refusing to listen on a non-local address without server.token set "
             "(or VIBEBOT_SERVER_TOKEN). Anyone who reaches this port can drive your browser."
         )
+
     url = f"http://{cfg.server.host}:{cfg.server.port}"
-    print(f"\n  VibeBot UI -> {url}{'?token=' + cfg.server.token if cfg.server.token else ''}\n")
-    uvicorn.run(create_app(cfg), host=cfg.server.host, port=cfg.server.port, log_level="warning")
+    if cfg.server.token:
+        url += f"?token={cfg.server.token}"
+
+    app = create_app(cfg)
+    server = uvicorn.Server(
+        uvicorn.Config(app, host=cfg.server.host, port=cfg.server.port, log_level="warning")
+    )
+    # The Quit button needs a way to bring uvicorn down cleanly, and
+    # uvicorn.run() gives you no handle on the server it creates.
+    app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
+
+    # flush= throughout: Python block-buffers stdout when it is not a console,
+    # so without it the banner only appears when the server finally exits.
+    print(flush=True)
+    print("  VibeBot is starting...", flush=True)
+    print(f"  UI  ->  {url}", flush=True)
+    print(flush=True)
+    print("  To stop it: press Quit in the page, run 'Stop VibeBot', or close", flush=True)
+    print("  this window.", flush=True)
+    print(flush=True)
+
+    if cfg.server.open_browser:
+        _open_when_ready(url, cfg.server.host, cfg.server.port)
+
+    with _pid_file(cfg.server.pid_file):
+        server.run()
+
+    print(flush=True)
+    print("  VibeBot has stopped. You can close this window.", flush=True)
+    print(flush=True)
+
+
+@contextmanager
+def _pid_file(path: str):
+    """Record the PID while the server runs, so stopping it is a double-click.
+
+    Best effort throughout: a path that cannot be written is a worse reason to
+    refuse to start than it is a problem.
+    """
+    target = Path(path).expanduser()
+    written = False
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(os.getpid()), encoding="ascii")
+        written = True
+    except OSError as exc:
+        log.debug("could not write %s: %s", target, exc)
+    try:
+        yield
+    finally:
+        if written:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+
+def _open_when_ready(url: str, host: str, port: int, timeout: float = 30.0) -> None:
+    """Open the UI once the port answers - opening it sooner gives a dead tab."""
+
+    def wait_then_open() -> None:
+        target = "127.0.0.1" if host == "0.0.0.0" else host  # noqa: S104 - probe only
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with socket.socket() as probe:
+                probe.settimeout(0.4)
+                if probe.connect_ex((target, port)) == 0:
+                    break
+            time.sleep(0.2)
+        else:
+            log.warning("server did not come up within %ss; not opening a browser", timeout)
+            return
+        try:
+            webbrowser.open(url)
+        except Exception as exc:  # noqa: BLE001 - a headless box has no browser
+            log.debug("could not open a browser: %s", exc)
+
+    threading.Thread(target=wait_then_open, name="open-ui", daemon=True).start()
