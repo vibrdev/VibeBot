@@ -73,6 +73,13 @@ class Agent:
         #: Set when you or the LLM just chose a page on purpose. Laya does not
         #: know that happened and will cheerfully undo it.
         self._just_navigated = False
+        #: Pages where the LLM has already said "no, not finished". Laya keeps
+        #: reporting done_p near 1.00 on a page of search results, and asking
+        #: again every step costs a call and takes the step away from Laya.
+        self._not_done: set[str] = set()
+        #: url -> consecutive scrolls, so a scroll that is going nowhere can
+        #: be named as such in the next prompt.
+        self._scrolls: dict[str, int] = {}
 
     # ------------------------------------------------------------- lifecycle
 
@@ -118,6 +125,8 @@ class Agent:
         self._task_host = ""
         self._drifted = ""
         self._just_navigated = False
+        self._not_done = set()
+        self._scrolls = {}
 
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
         trace = Trace(self.cfg.trace_dir, run_id)
@@ -209,6 +218,10 @@ class Agent:
             outcome = await self._execute(action, obs)
             if action.source == "laya":
                 self._tried.add((obs.url, action.op, action.element_idx))
+            if action.op == "scroll":
+                self._scrolls[obs.url] = self._scrolls.get(obs.url, 0) + 1
+            else:
+                self._scrolls.pop(obs.url, None)
             await self.emit("acted", step=step, action=action.describe(obs), outcome=outcome, source=action.source)
             self._history.append(f"{action.describe(obs)} -> {outcome}")
             self._record(trace, step, obs, candidates, verdict, action, outcome, escalated, started)
@@ -268,28 +281,35 @@ class Agent:
             note, self._drifted = self._drifted, ""
             return await self._llm_step(obs, candidates, note)
 
-        # 0b. Somebody who can read just chose this page on purpose. Laya does
-        #     not know why, and its instinct is to click the first thing on it
-        #     or press back - it undid a jump straight to the Eiffel Tower
-        #     article at p=0.95, and clicked that article's logo at p=1.00.
-        if self._just_navigated:
-            self._just_navigated = False
-            return await self._llm_step(
-                obs,
-                candidates,
-                "This page was opened deliberately one step ago to answer the goal. "
-                "Read it and act on what is here.",
-            )
+        # 0b. Somebody who can read just chose this page on purpose, so Laya
+        #     does not get to walk straight back off it. It used to lose every
+        #     step after a navigation to the LLM, which cost more than it
+        #     saved: on a page of shopping results Laya wanted "For Sale" at
+        #     p=0.91 and the LLM was asked instead, and clicked "Store".
+        just_navigated, self._just_navigated = self._just_navigated, False
 
         # 1. Laya thinks we are finished. Cheap to check, expensive to get wrong,
         #    so have the LLM confirm before we celebrate.
-        if verdict.done_p >= cfg.done_confidence:
+        if verdict.done_p >= cfg.done_confidence and obs.url not in self._not_done:
+            # Leading the witness here gets you agreement, not a check. Asked
+            # to "confirm with done", qwen3.5:4b ended a run on a page of
+            # Google results with "Goal confirmed: Found search results for
+            # cheapest second hand MacBook Pro M4" - which is not the answer to
+            # anything. So make it produce the value instead of a verdict.
             confirmed = await self._escalate(
-                obs, candidates, "Laya believes the goal is complete. Confirm with 'done' "
-                "(put the result in text) or continue with another action.",
+                obs,
+                candidates,
+                "Laya thinks the goal is met. Only agree if the thing the goal asks for "
+                "is on this page right now: if it wants a price, a number, a date or a "
+                "name, reply 'done' with that exact value in text. A page that merely "
+                "lists results, or links to where the answer might be, is not the answer. "
+                "If the value is not here, do NOT reply 'done' or 'extract', and do not "
+                "explain what is missing - reply with the next action (click, type, "
+                "navigate or scroll) that gets to it.",
             )
             if confirmed.op in TERMINAL_OPS - {"fail"}:
                 return _from_llm(confirmed), "llm"
+            self._not_done.add(obs.url)
             # It declined to call it finished and named something else to do.
             # Falling through to Laya's guess here threw that away and acted on
             # the worse-informed of the two: on a page of search results, Laya
@@ -300,12 +320,14 @@ class Agent:
         confident = verdict.is_confident(cfg.accept_probability, cfg.accept_margin)
         if not verdict.wants_llm and verdict.target in valid and confident:
             element = valid[verdict.target]
-            if not is_plausible(element, goal_terms(self.goal, obs.url)):
+            if _offtopic_and_unsure(
+                element, goal_terms(self.goal, obs.url), verdict.p_top, cfg.trust_confidence
+            ):
                 return await self._llm_step(
                     obs,
                     candidates,
-                    f"Laya is {verdict.p_top:.0%} sure about {element.label(60)}, but nothing "
-                    "about it relates to the goal. Pick something that does.",
+                    f"Laya is only {verdict.p_top:.0%} sure about {element.label(60)}, and "
+                    "nothing about it relates to the goal. Pick something that does.",
                 )
             op, needs_llm = _coerce_operation(verdict.operation, element, verdict.text)
             if needs_llm:
@@ -347,6 +369,15 @@ class Agent:
         # 3b. Cheap navigation escapes — no need to wake the LLM for these,
         #     unless we have already used this one here and come back round.
         if verdict.target in {"scroll", "back"} and confident:
+            if verdict.target == "back" and just_navigated:
+                # Measured: the LLM jumped straight to the Eiffel Tower article
+                # and Laya pressed back at p=0.95 on the very next step.
+                return await self._llm_step(
+                    obs,
+                    candidates,
+                    "Laya wants to go back, but this page was chosen deliberately one "
+                    "step ago. Work with what is on it.",
+                )
             if (obs.url, verdict.target, None) in self._tried:
                 return await self._llm_step(
                     obs,
@@ -376,6 +407,15 @@ class Agent:
         )
         if stalls >= self.cfg.policy.stall_limit:
             note += " The last few actions did not change the page; try something different."
+        scrolls = self._scrolls.get(obs.url, 0)
+        if scrolls >= 3:
+            # Told firmly enough not to answer without the value, the model
+            # scrolled the same results page six times instead.
+            note += (
+                f" You have already scrolled this page {scrolls} times without getting"
+                " closer; scrolling again will not help. Sort or filter the list, or"
+                " open one of the entries."
+            )
         return await self._llm_step(obs, candidates, note)
 
     async def _llm_step(self, obs: Observation, candidates: list, note: str) -> tuple[Action, str]:
@@ -580,6 +620,19 @@ class Agent:
         ]
         trace.write({"type": "step", **payload})
         trace.step_note(payload, self._step_llm)
+
+
+def _offtopic_and_unsure(element, terms: set[str], p_top: float, trust: float) -> bool:  # noqa: ANN001
+    """Is this pick worth an LLM call rather than just doing it?
+
+    Only when it is *both* unrelated to the goal's wording and something Laya
+    is not sure about. Requiring relatedness on its own was the mistake: the
+    check reads words, and plenty of good controls share none with the goal.
+    Replaying every recorded step, demanding it always let Laya act on 8% of
+    the steps it was confident about; demanding it only below p=0.85 gives
+    59%, and the picks it still stops are the vague ones.
+    """
+    return p_top < trust and not is_plausible(element, terms)
 
 
 def _coerce_operation(
