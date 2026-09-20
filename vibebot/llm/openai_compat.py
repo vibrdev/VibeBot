@@ -15,7 +15,15 @@ import httpx
 
 from ..config import LLMConfig
 from ..schema import Element, Observation
-from .base import LLMAction, SYSTEM_PROMPT, b64, parse_action, render_prompt
+from .base import (
+    LLMAction,
+    LLMHTTPError,
+    SYSTEM_PROMPT,
+    b64,
+    parse_action,
+    raise_for_status,
+    render_prompt,
+)
 
 log = logging.getLogger(__name__)
 
@@ -75,9 +83,9 @@ class OpenAICompatLLM:
 
         try:
             response = await self._client.get("/models", timeout=10.0)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
+            raise_for_status(response)
+        except LLMHTTPError as exc:
+            status = exc.status_code
             if status in {401, 403}:
                 return self._verdict(False, f"{self.host} rejected the key in ${self.cfg.api_key_env} ({status}).")
             # Plenty of local servers implement /chat/completions and nothing
@@ -130,7 +138,7 @@ class OpenAICompatLLM:
         }
         try:
             response = await self._client.post("/chat/completions", json=payload)
-            response.raise_for_status()
+            raise_for_status(response)
             choice = response.json()["choices"][0]
             text = choice["message"]["content"]
             finish = str(choice.get("finish_reason") or "")
@@ -153,7 +161,7 @@ class OpenAICompatLLM:
         }
         try:
             response = await self._client.post("/chat/completions", json=payload)
-            response.raise_for_status()
+            raise_for_status(response)
             return response.json()["choices"][0]["message"]["content"].strip()
         except Exception as exc:  # noqa: BLE001
             return f"(summary unavailable: {exc})"
