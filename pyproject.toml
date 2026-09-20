@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Local-first browser agent: Laya for fast decisions, a small LLM for the hard ones, you for the rest."
 readme = "README.md"
 requires-python = ">=3.10"
+# Tested on 3.11, 3.12 and 3.13 (3.13 including the real Laya weights).
+# 3.10 runs the app but has not been exercised with torch. 3.14 is untested.
 license = { text = "Apache-2.0" }
 dependencies = [
     "playwright>=1.47",

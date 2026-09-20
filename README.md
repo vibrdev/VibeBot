@@ -24,10 +24,15 @@ hosted LLMs are supported but off by default.
 
 ## Quickstart (Windows)
 
+Python **3.10 – 3.13**. 3.11, 3.12 and 3.13 are tested end to end, including the
+real Laya weights; 3.10 is the floor and runs the app but was not exercised with
+torch. 3.14 is untested — torch ships `cp314` wheels, so it will probably work,
+but do not find that out on a deadline.
+
 ```powershell
 git clone <this repo>
 cd VibeBot
-py -3.11 -m venv .venv
+py -3 -m venv .venv          # or py -3.13 / py -3.12 to pin one
 .venv\Scripts\activate
 
 pip install -r requirements.txt
