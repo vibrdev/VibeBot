@@ -79,11 +79,11 @@ class OllamaLLM:
             "options": {"temperature": self.cfg.temperature, "num_predict": self.cfg.max_tokens},
         }
         try:
-            content = await self._chat(payload)
+            content, done_reason = await self._chat(payload)
         except Exception as exc:  # noqa: BLE001
             log.warning("ollama call failed: %s", exc)
             return LLMAction(op="ask_user", text=f"My local LLM failed ({exc}). What should I do next?")
-        return parse_action(content)
+        return _finish(parse_action(content), done_reason, self.cfg)
 
     async def ask(self, prompt: str) -> str:
         """Free-form question — used for final summaries and done-verification."""
@@ -94,12 +94,17 @@ class OllamaLLM:
             "options": {"temperature": self.cfg.temperature},
         }
         try:
-            return (await self._chat(payload)).strip()
+            content, _ = await self._chat(payload)
+            return content.strip()
         except Exception as exc:  # noqa: BLE001
             return f"(summary unavailable: {exc})"
 
-    async def _chat(self, payload: dict) -> str:
-        """POST /api/chat and return the model's answer text.
+    async def _chat(self, payload: dict) -> tuple[str, str]:
+        """POST /api/chat and return (answer text, done_reason).
+
+        done_reason matters: "length" means the token budget cut the reply off,
+        which is not the same failure as a model that answered badly, and only
+        one of the two is fixed by raising llm.max_tokens.
 
         Handles two thinking-model traps. First, servers that reject the
         `think` field are retried once without it, and we remember. Second, a
@@ -125,12 +130,38 @@ class OllamaLLM:
             if send_think:
                 self._think_ok = True
 
-        message = response.json().get("message", {}) or {}
+        data = response.json()
+        message = data.get("message", {}) or {}
         content = (message.get("content") or "").strip()
-        return content or (message.get("thinking") or "")
+        return content or (message.get("thinking") or ""), str(data.get("done_reason") or "")
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+def _finish(action: LLMAction, done_reason: str, cfg: LLMConfig) -> LLMAction:
+    """Say so when the token budget, not the model, is what went wrong.
+
+    Measured on qwen3.5:4b: at num_predict=60 the reply stops one character
+    short of valid JSON (parse_action repairs that), and with think: on the
+    reasoning can eat the whole budget so `content` is empty and only prose
+    comes back (nothing to repair). Both used to surface as the same shrug.
+    """
+    if done_reason != "length":
+        return action
+    if action.op == "ask_user" and action.element_idx is None:
+        action.text = (
+            f"My reply hit the {cfg.max_tokens}-token limit (llm.max_tokens) before it was "
+            "valid JSON, so I have no action to take. Raise llm.max_tokens"
+            + (", or set llm.think: off so reasoning stops eating the budget" if cfg.think != "off" else "")
+            + ". What should I do next?"
+        )
+    else:
+        log.warning(
+            "reply truncated at llm.max_tokens=%s; recovered op=%r. Raise it if this repeats.",
+            cfg.max_tokens, action.op,
+        )
+    return action
 
 
 def _tagged(name: str) -> str:

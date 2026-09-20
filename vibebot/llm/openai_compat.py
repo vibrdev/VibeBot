@@ -131,11 +131,19 @@ class OpenAICompatLLM:
         try:
             response = await self._client.post("/chat/completions", json=payload)
             response.raise_for_status()
-            text = response.json()["choices"][0]["message"]["content"]
+            choice = response.json()["choices"][0]
+            text = choice["message"]["content"]
+            finish = str(choice.get("finish_reason") or "")
         except Exception as exc:  # noqa: BLE001
             log.warning("openai-compatible call failed: %s", exc)
             return LLMAction(op="ask_user", text=f"My LLM call failed ({exc}). What should I do next?")
-        return parse_action(text)
+        action = parse_action(text)
+        if finish == "length" and action.op == "ask_user" and action.element_idx is None:
+            action.text = (
+                f"My reply hit the {self.cfg.max_tokens}-token limit (llm.max_tokens) before it "
+                "was valid JSON. Raise llm.max_tokens. What should I do next?"
+            )
+        return action
 
     async def ask(self, prompt: str) -> str:
         payload = {

@@ -148,20 +148,72 @@ def parse_action(content: str) -> LLMAction:
 
 
 def _first_json_object(text: str) -> str | None:
+    """Pull one JSON object out of a model reply.
+
+    Two things measured against the real models forced this to be more than a
+    brace counter. A `}` inside a string value ("click the {x} button") used to
+    close the object early and produce garbage, so the scan now tracks strings
+    and escapes. And a reply cut off by the token budget never balances at all
+    — see :func:`_repair`.
+    """
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
     if fenced:
         return fenced.group(1)
+
+    start = text.find("{")
+    if start < 0:
+        return None
+
     depth = 0
-    start = -1
-    for i, char in enumerate(text):
-        if char == "{":
-            if depth == 0:
-                start = i
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        char = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
             depth += 1
-        elif char == "}" and depth:
+        elif char == "}":
             depth -= 1
             if depth == 0:
                 return text[start : i + 1]
+
+    return _repair(text[start:], depth, in_string)
+
+
+def _repair(blob: str, depth: int, in_string: bool) -> str | None:
+    """Close a reply that the token budget cut off mid-object.
+
+    Ollama reports this as done_reason "length" and hands back whatever it had
+    written. Measured on qwen3.5:4b at num_predict=60, that is every field the
+    agent needs and no closing brace — a complete, correct action thrown away
+    over one character. So: close an open string, drop a dangling key or
+    trailing comma, close the open braces, and if it still will not parse, shed
+    the last field and try again.
+    """
+    if in_string:
+        blob += '"'
+    blob = re.sub(r',\s*"[^"]*"\s*:\s*$', "", blob)
+
+    for _ in range(12):
+        candidate = re.sub(r",\s*$", "", blob) + "}" * depth
+        try:
+            json.loads(candidate)
+        except json.JSONDecodeError:
+            cut = blob.rfind(",")
+            if cut <= 0:
+                return None
+            blob = blob[:cut]
+            continue
+        return candidate
     return None
 
 

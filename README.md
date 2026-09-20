@@ -162,12 +162,28 @@ doctor` now calls that out, along with a missing API key on *any* hosted
 provider and a `model` the endpoint does not serve.
 
 **Thinking models need `llm.think: off`, which is the default.** Ollama turns
-thinking *on* by default for models that support it, and a thinking model puts
-its answer in `message.thinking` while `content` comes back empty — which looks
-exactly like a broken model. We send `think: false`, fall back to reading
-`thinking` if a model ignores that, and retry without the field on servers that
-reject it. Set `on` if you want the reasoning (slower), `auto` to leave it to
-the server.
+thinking *on* by default for models that support it. We send `think: false`,
+fall back to reading `message.thinking` if a model ignores that, and retry
+without the field on servers that reject it. Set `on` if you want the reasoning,
+`auto` to leave it to the server.
+
+Measured on qwen3.5:4b, not inherited from the vendor README:
+
+- `think: true` roughly **triples latency** (5.8s -> 19.3s on the same prompt)
+  and fills `message.thinking` *as well as* `content` — it does not leave
+  `content` empty the way older Ollama builds did.
+- `content` comes back empty only when thinking exhausts `llm.max_tokens`:
+  Ollama then returns `done_reason: "length"`, `content: ""` and 500-odd
+  characters of reasoning prose. There is no action in that, so it becomes a
+  question for you that names the budget.
+- A reply cut off at the budget while still writing JSON is **repaired, not
+  discarded**. At `num_predict: 60` the model produced every field the agent
+  needs and stopped one character before the closing brace; the old parser threw
+  that away and asked you what to do. It is now closed and used, and the
+  truncation is logged so you know to raise `llm.max_tokens`.
+- Sending `think: false` to a model with no thinking support (gemma3:1b) is
+  accepted with a 200 on current Ollama, not rejected. The retry-without-`think`
+  path stays for older servers, but it no longer fires here.
 
 One expectation to set: a newer VLM helps less here than the benchmarks imply.
 The model is never asked to *find* anything on screen — it gets a numbered
