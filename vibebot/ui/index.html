@@ -36,6 +36,24 @@
   #stage { position: relative; background: #05070a; display: grid; place-items: center; overflow: hidden; }
   #stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
   #stage .empty { color: var(--muted); font-size: 13px; }
+  #livedot {
+    position: absolute; top: 10px; right: 12px; display: none;
+    font: 700 10px/1 ui-monospace, monospace; letter-spacing: .1em;
+    color: var(--bad); background: #05070ad9; padding: 5px 8px; border-radius: 4px;
+  }
+  #livedot.on { display: block; animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  #tabstrip {
+    position: absolute; top: 10px; left: 12px; display: flex; gap: 6px;
+    max-width: calc(100% - 120px); overflow: hidden;
+  }
+  #tabstrip span {
+    font: 500 11px/1 ui-monospace, monospace; color: var(--muted);
+    background: #05070ad9; border: 1px solid var(--line); border-radius: 4px;
+    padding: 4px 7px; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 190px;
+  }
+  #tabstrip span.active { color: var(--accent); border-color: var(--accent); }
+  button.on { background: var(--bad); color: #fff; }
   aside { border-left: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
   #meta { padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
   #meta .pill {
@@ -72,12 +90,18 @@
   <b>VibeBot</b>
   <input id="goal" placeholder="What should I do? e.g. find the cheapest 65&quot; OLED on prisjakt.nu" autofocus />
   <button id="go">Run</button>
+  <button id="live" class="ghost" title="Stream the browser continuously instead of once per step">Live ○</button>
   <button id="pause" class="ghost">Pause</button>
   <button id="stop" class="ghost">Stop</button>
 </header>
 
 <main>
-  <div id="stage"><div class="empty">no screenshot yet — give it a goal</div></div>
+  <div id="stage">
+    <div class="empty" id="empty">no screenshot yet — give it a goal, or hit Live to watch</div>
+    <img id="shot" alt="browser view" hidden />
+    <div id="tabstrip"></div>
+    <div id="livedot">● LIVE</div>
+  </div>
   <aside>
     <div id="meta">
       <span class="pill" id="p-conn">connecting…</span>
@@ -104,7 +128,7 @@ const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.h
 
 const $ = (id) => document.getElementById(id);
 const feed = $('feed'), stage = $('stage');
-let socket, retry = 0;
+let socket, retry = 0, liveOn = false;
 
 function add(kind, title, sub, ratio) {
   const row = document.createElement('div');
@@ -144,8 +168,21 @@ function handle(e) {
     case 'run_start': add('user', 'GOAL: ' + e.goal); $('foot').textContent = 'running…'; break;
     case 'observation':
       $('p-url').textContent = e.title ? e.title + ' — ' + e.url : e.url;
-      if (e.screenshot) stage.innerHTML = `<img alt="page" src="${e.screenshot}">`;
-      $('foot').textContent = `step ${e.step} · ${e.candidates.length} candidates`;
+      // In live mode the stream owns the stage; don't fight it with stale stills.
+      if (e.screenshot && !liveOn) showImage(e.screenshot);
+      if (e.tabs) drawTabs(e.tabs);
+      $('foot').textContent = `step ${e.step} · ${e.candidates.length} candidates`
+        + (e.frames > 1 ? ` · ${e.frames} frames` : '') + (e.tabs && e.tabs.length > 1 ? ` · ${e.tabs.length} tabs` : '');
+      break;
+    case 'frame':
+      showImage(e.image);
+      drawTabs(e.tabs || []);
+      break;
+    case 'live':
+      liveOn = e.value;
+      $('live').textContent = liveOn ? 'Live ●' : 'Live ○';
+      $('live').classList.toggle('on', liveOn);
+      $('livedot').classList.toggle('on', liveOn);
       break;
     case 'verdict':
       add('laya', `${e.target} · p ${pct(e.p_top)} (+${pct(e.margin)}) · ${e.operation}`,
@@ -168,6 +205,23 @@ function handle(e) {
 }
 const pct = (v) => Math.round((v || 0) * 100) + '%';
 
+function showImage(src) {
+  const img = $('shot');
+  img.src = src;
+  img.hidden = false;
+  $('empty').style.display = 'none';
+}
+
+function drawTabs(tabs) {
+  const strip = $('tabstrip');
+  if (!tabs || tabs.length < 2) { strip.innerHTML = ''; return; }
+  strip.innerHTML = tabs.map(t => {
+    let host = t.url;
+    try { host = new URL(t.url).hostname || t.url; } catch (_) { /* about:blank */ }
+    return `<span class="${t.active ? 'active' : ''}">${esc(host)}</span>`;
+  }).join('');
+}
+
 function showAsk(q) { $('question').textContent = q; $('ask').classList.add('show'); $('answer').focus(); }
 function hideAsk() { $('ask').classList.remove('show'); $('answer').value = ''; }
 
@@ -175,6 +229,7 @@ const send = (obj) => socket && socket.readyState === 1 && socket.send(JSON.stri
 $('go').onclick = () => { const g = $('goal').value.trim(); if (g) { feed.innerHTML = ''; send({ type: 'run', goal: g }); } };
 $('goal').onkeydown = (e) => { if (e.key === 'Enter') $('go').click(); };
 $('stop').onclick = () => send({ type: 'stop' });
+$('live').onclick = () => send({ type: 'live', value: !liveOn });
 let paused = false;
 $('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; send({ type: 'pause', value: paused }); };
 $('send').onclick = () => { send({ type: 'answer', text: $('answer').value }); hideAsk(); };

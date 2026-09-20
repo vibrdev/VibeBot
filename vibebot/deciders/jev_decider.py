@@ -79,7 +79,7 @@ class JevDecider:
                 "target": {
                     "type": "choice",
                     "instructions": "Which element should be acted on next?",
-                    "criteria": element_criteria(candidates),
+                    "criteria": element_criteria(candidates, len(obs.tabs)),
                 },
                 "operation": {
                     "type": "choice",

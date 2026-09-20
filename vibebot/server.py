@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,9 +31,11 @@ class Hub:
         self.limit = limit
 
     async def publish(self, event: dict[str, Any]) -> None:
-        # Screenshots are big; keep them out of the replay buffer.
-        self.backlog.append({k: v for k, v in event.items() if k != "screenshot"})
-        del self.backlog[: max(0, len(self.backlog) - self.limit)]
+        # Images are big and stale within a second; keep them out of the replay
+        # buffer, and never buffer live frames at all.
+        if event.get("type") != "frame":
+            self.backlog.append({k: v for k, v in event.items() if k != "screenshot"})
+            del self.backlog[: max(0, len(self.backlog) - self.limit)]
         for client in list(self.clients):
             try:
                 await client.send_json(event)
@@ -40,17 +43,60 @@ class Hub:
                 self.clients.discard(client)
 
 
+def _data_url(png: bytes) -> str:
+    import base64
+
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
 def create_app(cfg: Config) -> FastAPI:
     app = FastAPI(title="VibeBot")
     hub = Hub()
     agent = Agent(cfg, on_event=hub.publish)
-    state: dict[str, Any] = {"task": None, "started": False}
+    state: dict[str, Any] = {"task": None, "started": False, "live": None}
     token = cfg.server.token or ""
 
     async def ensure_started() -> None:
         if not state["started"]:
             state["started"] = True
             await agent.start()
+
+    async def stream_frames() -> None:
+        """Push a screenshot every 1/live_fps seconds while someone is watching.
+
+        Deliberately decoupled from the step loop: the agent can be mid-think,
+        paused, or waiting on you, and the view keeps updating. Read-only — it
+        never touches the page, so it cannot disturb a run.
+        """
+        interval = 1.0 / max(0.2, cfg.server.live_fps)
+        misses = 0
+        try:
+            while hub.clients:
+                started = time.perf_counter()
+                png = await agent.browser.screenshot()
+                if png:
+                    misses = 0
+                    tabs = agent.browser.tabs()
+                    await hub.publish(
+                        {
+                            "type": "frame",
+                            "image": _data_url(png),
+                            "tabs": [{"index": t.index, "url": t.url, "active": t.active} for t in tabs],
+                        }
+                    )
+                else:
+                    misses += 1
+                    if misses > 10:  # browser gone — stop burning cycles
+                        break
+                # Capturing a PNG costs 100-200ms; sleep for what is left of the
+                # frame budget so the configured fps is roughly what you get.
+                await asyncio.sleep(max(0.02, interval - (time.perf_counter() - started)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the viewer must never kill a run
+            log.warning("live view stopped: %s", exc)
+        finally:
+            state["live"] = None
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
@@ -63,6 +109,7 @@ def create_app(cfg: Config) -> FastAPI:
                 "running": agent.running,
                 "paused": agent.paused,
                 "awaiting_user": agent.awaiting_user,
+                "live": state.get("live") is not None,
                 "goal": agent.goal,
                 "decider": agent.decider.name,
                 "llm": agent.llm.name,
@@ -73,9 +120,10 @@ def create_app(cfg: Config) -> FastAPI:
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         agent.stop()
-        task = state.get("task")
-        if task:
-            task.cancel()
+        for key in ("task", "live"):
+            running = state.get(key)
+            if running:
+                running.cancel()
         await agent.shutdown()
 
     @app.websocket("/ws")
@@ -118,6 +166,16 @@ def create_app(cfg: Config) -> FastAPI:
             if task:
                 task.cancel()
             await hub.publish({"type": "run_end", "status": "stopped", "summary": "Stopped by user."})
+        elif kind == "live":
+            want = bool(message.get("value", True))
+            running = state.get("live")
+            if want and not running:
+                await ensure_started()
+                state["live"] = asyncio.create_task(stream_frames())
+            elif not want and running:
+                running.cancel()
+                state["live"] = None
+            await hub.publish({"type": "live", "value": want, "fps": cfg.server.live_fps})
         elif kind == "pause":
             agent.paused = bool(message.get("value", True))
             await hub.publish({"type": "paused", "value": agent.paused})
