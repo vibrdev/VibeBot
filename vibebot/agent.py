@@ -507,7 +507,23 @@ class Agent:
             match = next((el for el in obs.elements if el.idx == action.element_idx), None)
             label = match.label().lower() if match else ""
         keyword_hit = any(word in label for word in policy.risky_keywords)
-        risky = action.risky >= self.cfg.decider.risk_threshold or keyword_hit
+        element = (
+            next((el for el in obs.elements if el.idx == action.element_idx), None)
+            if action.element_idx is not None
+            else None
+        )
+        # Laya's risky_p is not a usable signal on its own. Measured over 208
+        # recorded steps it sits above the 0.60 gate on 39% of them, averages
+        # 0.71 on labels that really are risky and 0.46 on labels that are not,
+        # and reported 1.00 for eBay's "Deals" link. Gating on it alone meant
+        # being asked to approve two steps in five, nearly all of them a plain
+        # link or a search box. So it only counts where the action could do
+        # something Back cannot undo; the keyword list, which is exact, still
+        # stops anything that spends, sends, consents or signs in.
+        reversible = element is not None and (
+            _is_plain_navigation(element, action.op) or _is_search_typing(element, action.op)
+        )
+        risky = keyword_hit or (action.risky >= self.cfg.decider.risk_threshold and not reversible)
 
         if action.op == "type" and policy.never_type_into_password and action.element_idx is not None:
             if await self.browser.element_is_password(action.element_idx):
@@ -650,6 +666,27 @@ SEARCH_HOSTS = (
     "google.", "bing.", "duckduckgo.", "ecosia.", "startpage.", "yahoo.",
     "search.brave.", "qwant.", "baidu.", "yandex.",
 )
+
+
+def _is_plain_navigation(element, op: str) -> bool:  # noqa: ANN001
+    """A click that only takes you to another page, which Back undoes."""
+    if op != "click":
+        return False
+    if element.tag != "a" and element.role != "link":
+        return False
+    href = (element.href or "").strip().lower()
+    # No href, "#" or a javascript: target means it does something instead of
+    # going somewhere, and that something is not necessarily reversible.
+    return bool(href) and href != "#" and not href.startswith("javascript:")
+
+
+def _is_search_typing(element, op: str) -> bool:  # noqa: ANN001
+    """Putting a query in a search box. Submitting it runs a search."""
+    if op != "type":
+        return False
+    if element.role == "searchbox" or element.input_type == "search":
+        return True
+    return "search" in f"{element.name} {element.placeholder}".lower()
 
 
 def _page_key(url: str) -> str:

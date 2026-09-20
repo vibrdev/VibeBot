@@ -30,7 +30,11 @@ decider:
   accept_probability: 0.55 # p(top option) needed to act without the LLM
   accept_margin: 0.15      # …and how far ahead of the runner-up it must be
   done_confidence: 0.80    # "goal achieved" threshold (LLM double-checks)
-  risk_threshold: 0.60     # P(consequential) above which you get asked
+  risk_threshold: 0.60     # P(consequential) above which you get asked. Only
+                           # applies to actions Back cannot undo: following a
+                           # link or typing in a search box never asks on this
+                           # score alone (measured, it reads 1.00 for eBay's
+                           # "Deals" link). policy.risky_keywords still does.
   # Paid alternative, off by default:
   # backend: jev
   # jev_base_url: https://api.example.com
