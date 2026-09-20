@@ -1,0 +1,57 @@
+# Copy to config.yaml and edit. Every value can also be set with an env var:
+#   VIBEBOT_<SECTION>_<FIELD>   e.g. VIBEBOT_POLICY_AUTONOMY=yolo
+# Defaults are 100% local and 100% free.
+
+browser:
+  headless: false          # forced on automatically when there is no display
+  width: 1440
+  height: 900
+  user_data_dir: ./.vibebot/profile   # logins persist here between runs
+  start_url: about:blank
+  locale: en-US
+
+decider:
+  backend: laya            # laya | jev | heuristic
+  model: auto              # auto = Laya's Router; or convaiinnovations/laya[-multilingual]
+  device: cpu              # cuda if you have a GPU
+  max_candidates: 12       # elements Laya chooses between (its context is small)
+  page_text_chars: 600     # page text sent to Laya; lower = faster (200 is snappy)
+  accept_probability: 0.55 # p(top option) needed to act without the LLM
+  accept_margin: 0.15      # …and how far ahead of the runner-up it must be
+  done_confidence: 0.80    # "goal achieved" threshold (LLM double-checks)
+  risk_threshold: 0.60     # P(consequential) above which you get asked
+  # Paid alternative, off by default:
+  # backend: jev
+  # jev_base_url: https://api.example.com
+  # jev_api_key_env: JEV_API_KEY
+
+llm:
+  backend: ollama          # ollama | openai | none
+  model: qwen2.5vl:7b      # any vision model: ollama pull qwen2.5vl:7b
+  base_url: http://127.0.0.1:11434
+  vision: true             # send annotated screenshots (needs a vision model)
+  temperature: 0.1
+  timeout_s: 180
+  max_tokens: 1024
+  # Paid alternative (also works for OpenRouter / LM Studio / vLLM):
+  # backend: openai
+  # model: gpt-4o-mini
+  # base_url: https://api.openai.com
+  # api_key_env: OPENAI_API_KEY
+
+policy:
+  autonomy: normal         # guided (confirm everything) | normal | yolo
+  max_steps: 40
+  max_llm_calls: 25
+  stall_limit: 3
+  allow_domains: []        # e.g. [google.com, wikipedia.org] — empty = anywhere
+  block_domains: []
+  never_type_into_password: true
+  user_reply_timeout_s: 900
+
+server:
+  host: 127.0.0.1
+  port: 8765
+  token: ""                # REQUIRED if you bind to 0.0.0.0 on a server
+
+trace_dir: ./.vibebot/traces

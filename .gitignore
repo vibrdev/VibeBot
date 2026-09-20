@@ -1,0 +1,12 @@
+.vibebot/
+config.yaml
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.DS_Store
