@@ -262,11 +262,73 @@ two methods at the bottom of that file are all that need changing.
 
 ## Traces
 
-Every run writes `.vibebot/traces/<run-id>/steps.jsonl` plus a screenshot per
-step: the candidate list, Laya's full distribution, which layer decided, what
-happened. Useful for debugging, and it is also labelled training data — every
-step where Laya deferred and the LLM picked correctly is a fine-tuning example
-for making Laya handle *your* sites without the LLM.
+Every run writes `.vibebot/traces/<run-id>/`:
+
+| file | what is in it |
+|---|---|
+| `run.log` | the run as readable text — candidates, Laya's verdict, what the LLM was asked, what it replied verbatim, the action, the outcome, memory per step |
+| `steps.jsonl` | the same events complete, for analysis |
+| `step-NNN.png` | exactly what the model was shown |
+| `step-NNN-llmN.prompt.txt` | the exact prompt behind each LLM call |
+
+`run.log` is the one to open first. A step reads:
+
+```
+--- step 5 --- https://www.ebay.com/globaldeals
+    candidates : 12
+        e18: combobox "Search for anything"
+        e3: a "Deals"
+    laya       : laya -> e3 p=1.0 margin=1.0 op=click done_p=0.35 (9017ms)
+    llm ask    : Laya wants to click a "Deals" again, and this page has already had
+                 exactly that. It did not get us anywhere — pick something else.
+    llm reply  : {"op":"click","element_idx":[18],"text":"MacBook Pro M4", ...}
+    action     : [llm] type idx=18 text='MacBook Pro M4'
+    outcome    : typed 'MacBook Pro M4' into element 18  (19480ms)
+    memory     : 1,053 MB headroom (26,683/27,736 MB committed, 3,826 MB RAM free)
+```
+
+That format is not decoration — every bug fixed in the last pass was found by
+reading it. The `element_idx: [18]` above is a real example: the model picked
+the right box and the parser dropped the answer because it was a list.
+
+The rows are also labelled training data — every step where Laya deferred and
+the LLM picked correctly is a fine-tuning example for making Laya handle *your*
+sites without the LLM.
+
+## Memory
+
+The thing most likely to break a run on a laptop is not the model size, it is
+the **commit limit**. Measured on a 16 GB Windows machine mid-run:
+
+```
+Committed : 22.5 GB
+Limit     : 25.2 GB
+HEADROOM  :  2.8 GB   <- what a new allocation must fit in
+Available physical: 7,009 MB
+```
+
+With 7 GB of RAM apparently free, torch refused an 8 MB tensor and the process
+segfaulted with no traceback. Windows charges every allocation against the
+commit limit (RAM + pagefile) and declines it when the charge does not fit,
+however much RAM is idle — and a C extension treats that refusal as fatal.
+
+What VibeBot costs, measured on that machine:
+
+| | commit |
+|---|---|
+| Laya, `preload: true` (English + multilingual) | ~4.9 GB |
+| Laya, `preload: false` (default — English only, lazily) | ~2.0 GB |
+| `qwen3.5:4b` resident in Ollama, any screenshot size | ~5.7 GB |
+| Chromium, one window | ~1.1 GB |
+
+So the defaults changed: Laya no longer preloads weights an English run never
+touches, `vibebot doctor` prints the headroom, `decider.min_headroom_mb` skips
+Laya (loudly) rather than dying when memory is short, and VibeBot tells Ollama
+to release the model when a run ends instead of leaving 5.7 GB committed for
+another five minutes.
+
+If a run still dies, the biggest wins are usually outside VibeBot: an idle WSL
+or Docker VM holds several GB, and so does a second browser.
 
 ## Layout
 
@@ -288,6 +350,19 @@ vibebot/
 - Cross-origin iframes are read through Playwright, so they work — but a frame
   that navigates mid-step is skipped for that step rather than retried.
 - Zero-shot Laya is weak on unusual pages; the LLM carries those steps. The
-  trace files exist so you can fix that with a fine-tune.
+  trace files exist so you can fix that with a fine-tune. Measured on eBay's
+  home page it picks "Deals" or "My eBay" over the search box at p=1.00, so the
+  loop breaker below does a lot of the real work.
+- Laya has no memory between steps, so an exact repeat of (page, action) means
+  a loop rather than a decision. The second time a page asks for the same
+  action the step goes to the LLM instead. Without this, runs spent their whole
+  budget bouncing between two pages.
+- Search engines block the agent. A run aimed at Google landed on
+  `/sorry/index` (the "unusual traffic" check) and never recovered; VibeBot
+  will not solve a CAPTCHA for you. Go to the site you actually want.
+- `qwen3.5:4b` gets the mechanics right and the judgement wrong. Asked for the
+  *cheapest used* MacBook Pro M4 it searched correctly, then reported the first
+  listing on the page without sorting by price or filtering to used. Treat the
+  answer as a starting point, or use a bigger model.
 
 Apache-2.0.

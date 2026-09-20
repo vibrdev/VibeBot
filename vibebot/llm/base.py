@@ -58,6 +58,10 @@ class LLMAction:
     reason: str = ""
     confidence: float = 0.0
     raw: str = ""
+    """The model's reply verbatim (truncated). Logged, so a bad step can be
+    read back afterwards instead of guessed at."""
+    prompt: str = ""
+    """The prompt that produced it. Same reason."""
 
 
 class LLM(Protocol):
@@ -128,11 +132,7 @@ def parse_action(content: str) -> LLMAction:
     except json.JSONDecodeError:
         return LLMAction(op="ask_user", text="I produced invalid JSON — what should I do next?", raw=text)
 
-    idx = data.get("element_idx")
-    if isinstance(idx, str):
-        idx = int(idx) if idx.strip().lstrip("-").isdigit() else None
-    if isinstance(idx, float):
-        idx = int(idx)
+    idx = _as_element_idx(data.get("element_idx"))
 
     try:
         confidence = float(data.get("confidence", 0.5))
@@ -141,12 +141,36 @@ def parse_action(content: str) -> LLMAction:
 
     return LLMAction(
         op=str(data.get("op") or data.get("operation") or "ask_user").strip().lower(),
-        element_idx=idx if isinstance(idx, int) else None,
+        element_idx=idx,
         text=str(data.get("text") or ""),
         reason=str(data.get("reason") or ""),
         confidence=max(0.0, min(1.0, confidence)),
         raw=text[:2000],
     )
+
+
+def _as_element_idx(value: Any) -> int | None:
+    """The element number, however the model chose to spell it.
+
+    Observed from qwen3.5:4b on a real run: it answered `"element_idx": [18]`,
+    a one-item list, having correctly picked eBay's search box. The old parser
+    accepted only int/str/float, so that became None and the agent fell back to
+    scrolling — the model's one good decision of the run, discarded. The prompt
+    numbers elements "e18", so a model echoing that spelling is just as likely.
+    """
+    if isinstance(value, bool):  # bool is an int subclass; not an index
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, (list, tuple)):
+        # Only a single choice is meaningful; two elements is not an action.
+        return _as_element_idx(value[0]) if len(value) == 1 else None
+    if isinstance(value, str):
+        match = re.search(r"-?\d+", value)
+        return int(match.group()) if match else None
+    return None
 
 
 def _first_json_object(text: str) -> str | None:

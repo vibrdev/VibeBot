@@ -26,6 +26,7 @@ from typing import Any
 
 from ..config import DeciderConfig
 from ..schema import Element, Observation
+from ..sysmem import snapshot
 from .base import Verdict, build_state, element_criteria, pick
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,10 @@ class LayaDecider:
         self.cfg = cfg
         self._agent: Any = None
         self._error: str | None = None
+        #: The weights load on the first predict when preload is off, so the
+        #: memory guard has to hold until that has actually happened.
+        self._warm = False
+        self._failures = 0
 
     # ------------------------------------------------------------------ setup
 
@@ -51,7 +56,7 @@ class LayaDecider:
         return self._error is None
 
     def load(self) -> None:
-        """Import and warm the model. Slow (seconds), so do it once up front."""
+        """Import the library and prepare the model. Slow (seconds) either way."""
         try:
             import laya  # noqa: PLC0415 - optional heavy dependency
         except ImportError as exc:
@@ -59,15 +64,46 @@ class LayaDecider:
             log.warning(self._error)
             return
 
+        shortfall = self._memory_shortfall()
+        if shortfall:
+            # Degrade on purpose rather than die by accident: torch treats a
+            # declined commit charge as fatal, so the process would segfault
+            # here with no traceback to explain it.
+            self._error = shortfall
+            log.warning(self._error)
+            return
+
         try:
             if self.cfg.model in ("auto", "router", ""):
-                self._agent = laya.Router(preload=True, device=self.cfg.device)
+                self._agent = laya.Router(preload=self.cfg.preload, device=self.cfg.device)
             else:
                 self._agent = laya.load(self.cfg.model, device=self.cfg.device)
-            log.info("Laya ready (%s, device=%s)", self.cfg.model, self.cfg.device)
+            self._warm = self.cfg.preload or self.cfg.model not in ("auto", "router", "")
+            log.info(
+                "Laya ready (%s, device=%s, %s)",
+                self.cfg.model,
+                self.cfg.device,
+                "preloaded" if self._warm else "weights load on first step",
+            )
         except Exception as exc:  # noqa: BLE001 - model load can fail many ways
             self._error = f"could not load Laya: {exc}"
             log.warning(self._error)
+
+    def _memory_shortfall(self) -> str | None:
+        """Why we should not touch the weights right now, if we should not."""
+        memory = snapshot()
+        if memory is None or self.cfg.min_headroom_mb <= 0:
+            return None
+        if memory.headroom_mb >= self.cfg.min_headroom_mb:
+            return None
+        return (
+            f"only {memory.headroom_mb:,.0f} MB of memory can still be committed "
+            f"({memory.committed_mb:,.0f} of {memory.limit_mb:,.0f} MB in use; "
+            f"{memory.available_mb:,.0f} MB RAM free), below the "
+            f"{self.cfg.min_headroom_mb:,} MB decider.min_headroom_mb floor. "
+            "Free memory (an idle Ollama model holds ~5.7 GB; a WSL/Docker VM is "
+            "often several GB more) or lower the floor to try anyway."
+        )
 
     @property
     def error(self) -> str | None:
@@ -86,6 +122,19 @@ class LayaDecider:
         if self._agent is None:
             return Verdict(target="ask_llm", backend="laya-unavailable")
 
+        if not self._warm:
+            # First real step with lazy weights: the same commit charge that
+            # kills the process at load time is charged here instead.
+            shortfall = self._memory_shortfall()
+            if shortfall:
+                self._failures += 1
+                log.warning("Laya skipped, every step is going to the LLM: %s", shortfall)
+                return Verdict(
+                    target="ask_llm",
+                    backend="laya-low-memory",
+                    raw={"error": shortfall, "consecutive_failures": self._failures},
+                )
+
         state = build_state(goal, obs, history, self.cfg.page_text_chars)
         questions = self._questions(candidates, text_options, len(obs.tabs))
 
@@ -94,9 +143,28 @@ class LayaDecider:
             # torch is blocking; keep the event loop (and the live UI) responsive.
             result = await asyncio.to_thread(self._agent.predict, state, questions)
         except Exception as exc:  # noqa: BLE001 - never let the brain kill the run
-            log.warning("Laya predict failed: %s", exc)
-            return Verdict(target="ask_llm", backend="laya-error", raw={"error": str(exc)})
+            self._failures += 1
+            memory = snapshot()
+            # A silent fall through to the LLM turns a broken decider into a
+            # slow, expensive run that still looks like it is working. Say it.
+            log.warning(
+                "Laya predict failed (%s in a row), so this step goes to the LLM: %s%s",
+                self._failures,
+                exc,
+                f" [{memory.short()}]" if memory else "",
+            )
+            return Verdict(
+                target="ask_llm",
+                backend="laya-error",
+                raw={
+                    "error": str(exc),
+                    "consecutive_failures": self._failures,
+                    "memory": memory.short() if memory else None,
+                },
+            )
         latency = int((time.perf_counter() - started) * 1000)
+        self._warm = True
+        self._failures = 0
 
         answers = result.get("answers", result) if isinstance(result, dict) else {}
         target = str(pick(answers, "target", "choice", "label", default="ask_llm"))
