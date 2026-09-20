@@ -331,7 +331,12 @@ class BrowserSession:
             pass
         await locator.type(text, delay=18)
         if submit:
-            await locator.press("Enter")
+            # Press through the keyboard, not the locator. Typing into a search
+            # box opens an autocomplete that can replace the input node, and
+            # locator.press then re-resolves it and times out: Wikipedia's
+            # search failed this way twice in one run, both times after the
+            # text had already gone in.
+            await locator.page.keyboard.press("Enter")
         await self._settle()
         return f"typed {text!r} into element {idx}"
 

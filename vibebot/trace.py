@@ -84,6 +84,11 @@ class Trace:
         for call in llm_calls:
             self.note(f"    llm ask    : {call.get('note', '')[:160]}")
             self.note(f"    llm reply  : {str(call.get('raw', ''))[:400]}")
+        for ask in record.get("asked_you", []):
+            # A run someone sat and approved used to read back as if they had
+            # never been there at all.
+            self.note(f"    ASKED YOU  : {str(ask.get('question', ''))[:300]}")
+            self.note(f"    YOU SAID   : {str(ask.get('answer', ''))[:200]}")
         self.note(
             f"    action     : [{action.get('source')}] {action.get('op')} "
             f"idx={action.get('element_idx')} text={str(action.get('text'))[:60]!r} "

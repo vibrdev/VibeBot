@@ -333,3 +333,64 @@ def test_ordinary_buttons_are_not_risky():
     words = PolicyConfig().risky_keywords
     for label in ("Search", "Next page", "Used (387) Items", "Price + Shipping: lowest first"):
         assert not any(word in label.lower() for word in words), label
+
+
+# -------------------------------------------------- what the log must show
+
+def test_search_engines_are_a_waypoint_not_the_destination():
+    """The drift guard fired on a click from Google to eBay - "which is not
+    what the goal is about" - when following a search result to a shop is the
+    entire point of searching."""
+    from vibebot.agent import _is_search_host
+
+    for host in ("www.google.com", "google.se", "duckduckgo.com", "www.bing.com"):
+        assert _is_search_host(host), host
+    for host in ("www.ebay.com", "en.wikipedia.org", "backmarket.se", "creativecommons.org"):
+        assert not _is_search_host(host), host
+
+
+def test_trace_writes_down_what_you_were_asked(tmp_path):
+    """A run you approved must read back as a run you approved."""
+    from vibebot.trace import Trace
+
+    trace = Trace(str(tmp_path), "run")
+    record = {
+        "step": 3,
+        "url": "https://example.com",
+        "title": "t",
+        "candidates": [],
+        "laya": {"backend": "laya", "target": "e1"},
+        "action": {"op": "click", "source": "laya"},
+        "outcome": "clicked element 1",
+        "asked_you": [{"question": "About to: click Buy Now", "answer": "ok"}],
+    }
+    trace.step_note(record, [])
+    log = (tmp_path / "run" / "run.log").read_text(encoding="utf-8")
+    assert "ASKED YOU" in log and "click Buy Now" in log
+    assert "YOU SAID" in log and "ok" in log
+
+
+# ------------------------------------------------------- one key per page
+
+def test_the_same_page_spelled_two_ways_is_one_key():
+    """Wikipedia served title=Special:Search and title=Special%3ASearch for the
+    same results page two steps apart. The loop guard saw two pages and let
+    Laya bounce between that page and a red link for the rest of the run."""
+    from vibebot.agent import _page_key
+
+    a = "https://en.wikipedia.org/w/index.php?search=Eiffel+Tower&title=Special:Search&fulltext=1"
+    b = "https://en.wikipedia.org/w/index.php?search=Eiffel+Tower&title=Special%3ASearch&fulltext=1"
+    assert _page_key(a) == _page_key(b)
+
+
+def test_page_key_ignores_the_fragment_and_case_of_the_host():
+    from vibebot.agent import _page_key
+
+    assert _page_key("https://EN.wikipedia.org/wiki/X#Licensing") == _page_key("https://en.wikipedia.org/wiki/X")
+
+
+def test_page_key_keeps_genuinely_different_pages_apart():
+    from vibebot.agent import _page_key
+
+    assert _page_key("https://ebay.com/a") != _page_key("https://ebay.com/b")
+    assert _page_key("https://ebay.com/s?q=one") != _page_key("https://ebay.com/s?q=two")
