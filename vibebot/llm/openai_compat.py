@@ -144,8 +144,13 @@ class OpenAICompatLLM:
             finish = str(choice.get("finish_reason") or "")
         except Exception as exc:  # noqa: BLE001
             log.warning("openai-compatible call failed: %s", exc)
-            return LLMAction(op="ask_user", text=f"My LLM call failed ({exc}). What should I do next?")
+            return LLMAction(
+                op="ask_user",
+                text=f"My LLM call failed ({exc}). What should I do next?",
+                prompt=prompt,
+            )
         action = parse_action(text)
+        action.prompt = prompt
         if finish == "length" and action.op == "ask_user" and action.element_idx is None:
             action.text = (
                 f"My reply hit the {self.cfg.max_tokens}-token limit (llm.max_tokens) before it "

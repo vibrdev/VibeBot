@@ -1,5 +1,6 @@
 # Core runtime — everything here is free and works offline.
 playwright>=1.47
+Pillow>=10.0          # screenshot downscaling: 1440px -> 1024px is ~half the image tokens
 fastapi>=0.115
 uvicorn[standard]>=0.30   # [standard] is not optional: the UI is a WebSocket.
                           # Plain uvicorn has no WS implementation and the page

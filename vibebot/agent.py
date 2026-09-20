@@ -30,8 +30,9 @@ from .browser import BrowserSession
 from .config import Config
 from .deciders import Verdict, build_decider
 from .llm import build_llm
-from .ranking import rank_candidates, text_candidates
+from .ranking import goal_terms, is_plausible, rank_candidates, text_candidates
 from .schema import GLOBAL_OPS, TERMINAL_OPS, Action, Observation, StepRecord
+from .sysmem import snapshot
 from .trace import Trace
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,23 @@ class Agent:
         self._llm_calls = 0
         self._history: list[str] = []
         self._fingerprints: list[str] = []
+        #: Every LLM exchange in the current step, so the trace can show what
+        #: the model was asked and what it actually replied.
+        self._step_llm: list[dict[str, Any]] = []
+        #: (url, op, element) triples Laya has already been allowed to try on
+        #: this run. Laya has no memory between steps, so an exact repeat means
+        #: a loop, not a decision: real runs clicked eBay's "Deals" six times
+        #: running, then bounced ebay.com -> "My eBay" -> sign-in -> back ->
+        #: ebay.com for the whole step budget. The second time round the same
+        #: page wants the same action, the LLM gets the step instead.
+        self._tried: set[tuple[str, str, int | None]] = set()
+        #: The site the goal is actually about, set whenever you or the LLM
+        #: chose where to go. Laya wandering off it is a wrong turn, not a plan.
+        self._task_host = ""
+        self._drifted = ""
+        #: Set when you or the LLM just chose a page on purpose. Laya does not
+        #: know that happened and will cheerfully undo it.
+        self._just_navigated = False
 
     # ------------------------------------------------------------- lifecycle
 
@@ -68,6 +86,12 @@ class Agent:
         ok, message = await self.llm.ping()  # type: ignore[attr-defined]
         status["llm_ready"] = ok
         status["llm_message"] = message
+
+        memory = snapshot()
+        if memory is not None:
+            status["memory"] = memory.short()
+            if memory.headroom_mb < self.cfg.decider.min_headroom_mb:
+                log.warning("starting with little memory to spare: %s", memory.short())
         await self.emit("status", **status)
         return status
 
@@ -90,10 +114,20 @@ class Agent:
         self._llm_calls = 0
         self._history = []
         self._fingerprints = []
+        self._tried = set()
+        self._task_host = ""
+        self._drifted = ""
+        self._just_navigated = False
 
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
         trace = Trace(self.cfg.trace_dir, run_id)
-        trace.write({"type": "run_start", "goal": goal, "config": self.cfg.to_dict()})
+        trace.start(goal, self.cfg.to_dict())
+        trace.note(
+            f"decider: {self.decider.name}"
+            + (f" (DEGRADED from {getattr(self.decider, 'degraded_from', None)})"
+               if getattr(self.decider, "degraded_from", None) else "")
+            + f" | llm: {self.llm.name} {self.cfg.llm.model}"
+        )
         await self.emit("run_start", goal=goal, run_id=run_id)
 
         status, summary = "max_steps", "Ran out of steps before finishing."
@@ -103,8 +137,14 @@ class Agent:
             status, summary = "stopped", "Stopped by user."
             raise
         except Exception as exc:  # noqa: BLE001 - surface crashes in the UI
+            import traceback
+
             log.exception("run failed")
             status, summary = "error", f"{type(exc).__name__}: {exc}"
+            # A crash used to leave nothing behind but a one-line summary.
+            trace.write({"type": "error", "error": summary, "traceback": traceback.format_exc()})
+            trace.note(f"!! CRASH {summary}")
+            trace.note(traceback.format_exc())
         finally:
             self.running = False
             trace.finish(status, summary)
@@ -122,6 +162,7 @@ class Agent:
                 await asyncio.sleep(0.2)
 
             started = time.perf_counter()
+            self._step_llm = []
             obs = await self.browser.observe()
             obs.step = step
 
@@ -166,12 +207,34 @@ class Agent:
 
             before = obs.fingerprint()
             outcome = await self._execute(action, obs)
+            if action.source == "laya":
+                self._tried.add((obs.url, action.op, action.element_idx))
             await self.emit("acted", step=step, action=action.describe(obs), outcome=outcome, source=action.source)
             self._history.append(f"{action.describe(obs)} -> {outcome}")
             self._record(trace, step, obs, candidates, verdict, action, outcome, escalated, started)
 
-            after = (await self.browser.observe(screenshot=False)).fingerprint()
+            landed = await self.browser.observe(screenshot=False)
+            host = (urlparse(landed.url).hostname or "").lower()
+            self._just_navigated = action.source in {"llm", "user"} and action.op == "navigate"
+            if action.source in {"llm", "user"} and host:
+                # Wherever you or the LLM deliberately went is the task's site.
+                self._task_host = host
+            elif action.source == "laya" and host and self._task_host and host != self._task_host:
+                # Measured: on Wikipedia's front page Laya clicked a photo
+                # caption at p=0.74, then its licence link at p=0.97, and the
+                # run was on creativecommons.org two steps from the goal.
+                self._drifted = (
+                    f"That last click left {self._task_host} and landed on {host}, which is "
+                    f"not what the goal is about. Get back on track."
+                )
+                self._history.append(f"wandered off {self._task_host} onto {host}")
+
+            after = landed.fingerprint()
             if after == before:
+                # Succeeding and achieving nothing is its own kind of dead end:
+                # clicking the link for the page you are already on returns
+                # "clicked element 3" forever. Bar it whoever chose it.
+                self._tried.add((obs.url, action.op, action.element_idx))
                 stalls += 1
                 if stalls >= policy.stall_limit * 2:
                     answer = await self.ask_user(
@@ -200,6 +263,24 @@ class Agent:
         cfg = self.cfg.decider
         valid = {f"e{el.idx}": el for el in candidates}
 
+        # 0. We are somewhere Laya wandered to. It has no idea that happened.
+        if self._drifted:
+            note, self._drifted = self._drifted, ""
+            return await self._llm_step(obs, candidates, note)
+
+        # 0b. Somebody who can read just chose this page on purpose. Laya does
+        #     not know why, and its instinct is to click the first thing on it
+        #     or press back - it undid a jump straight to the Eiffel Tower
+        #     article at p=0.95, and clicked that article's logo at p=1.00.
+        if self._just_navigated:
+            self._just_navigated = False
+            return await self._llm_step(
+                obs,
+                candidates,
+                "This page was opened deliberately one step ago to answer the goal. "
+                "Read it and act on what is here.",
+            )
+
         # 1. Laya thinks we are finished. Cheap to check, expensive to get wrong,
         #    so have the LLM confirm before we celebrate.
         if verdict.done_p >= cfg.done_confidence:
@@ -209,19 +290,34 @@ class Agent:
             )
             if confirmed.op in TERMINAL_OPS - {"fail"}:
                 return _from_llm(confirmed), "llm"
+            # It declined to call it finished and named something else to do.
+            # Falling through to Laya's guess here threw that away and acted on
+            # the worse-informed of the two: on a page of search results, Laya
+            # kept clicking back to "Deals" and losing them.
+            return await self._use_llm_decision(confirmed, obs, candidates)
 
         # 2. Fast path: Laya is confident about a real element.
         confident = verdict.is_confident(cfg.accept_probability, cfg.accept_margin)
         if not verdict.wants_llm and verdict.target in valid and confident:
             element = valid[verdict.target]
-            op = verdict.operation
-            is_field = element.tag in {"input", "textarea"} or element.role in {
-                "searchbox", "textbox", "combobox",
-            }
-            if op == "type" and not verdict.text:
-                op = "click" if not is_field else op
-            if op == "type" and not verdict.text:
-                return await self._llm_step(obs, candidates, "Laya wants to type here but has no text.")
+            if not is_plausible(element, goal_terms(self.goal, obs.url)):
+                return await self._llm_step(
+                    obs,
+                    candidates,
+                    f"Laya is {verdict.p_top:.0%} sure about {element.label(60)}, but nothing "
+                    "about it relates to the goal. Pick something that does.",
+                )
+            op, needs_llm = _coerce_operation(verdict.operation, element, verdict.text)
+            if needs_llm:
+                return await self._llm_step(obs, candidates, needs_llm)
+            if (obs.url, op, element.idx) in self._tried:
+                return await self._llm_step(
+                    obs,
+                    candidates,
+                    f"Laya wants to {op} {element.label(60)} again, and this page has "
+                    "already had exactly that. It did not get us anywhere — pick "
+                    "something else.",
+                )
             action = Action(
                 op=op,
                 element_idx=element.idx,
@@ -248,8 +344,16 @@ class Agent:
                 None,
             )
 
-        # 3b. Cheap navigation escapes — no need to wake the LLM for these.
+        # 3b. Cheap navigation escapes — no need to wake the LLM for these,
+        #     unless we have already used this one here and come back round.
         if verdict.target in {"scroll", "back"} and confident:
+            if (obs.url, verdict.target, None) in self._tried:
+                return await self._llm_step(
+                    obs,
+                    candidates,
+                    f"Laya wants to {verdict.target} from this page again, which is "
+                    "where we were last time round. Break the loop.",
+                )
             return (
                 Action(
                     op=verdict.target,
@@ -283,6 +387,10 @@ class Agent:
             return Action(op="wait", text="1", reason=f"user: {answer}", source="user"), "user"
 
         decision = await self._escalate(obs, candidates, note)
+        return await self._use_llm_decision(decision, obs, candidates)
+
+    async def _use_llm_decision(self, decision, obs: Observation, candidates: list) -> tuple[Action, str]:  # noqa: ANN001
+        """Turn one LLM reply into the step's action."""
         if decision.op == "ask_user":
             question = decision.text or "I am not sure how to continue. What should I do?"
             answer = await self.ask_user(question)
@@ -292,6 +400,11 @@ class Agent:
         action = _from_llm(decision)
         if action.op not in GLOBAL_OPS and action.element_idx is None:
             return Action(op="scroll", text="down", reason="llm gave no target", source="policy"), "llm"
+        element = next((el for el in obs.elements if el.idx == action.element_idx), None)
+        if element is not None:
+            action.op, _ = _coerce_operation(
+                action.op, element, action.text, text_is_deliberate=True
+            )
         return await self._risk_gate(action, obs), "llm"
 
     async def _escalate(self, obs: Observation, candidates: list, note: str):
@@ -299,6 +412,19 @@ class Agent:
         await self.emit("thinking", note=note, calls=self._llm_calls)
         decision = await self.llm.decide(
             self.goal, obs, candidates, self._history, note, obs.annotated_png if self.cfg.llm.vision else None
+        )
+        self._step_llm.append(
+            {
+                "note": note,
+                "op": decision.op,
+                "element_idx": decision.element_idx,
+                "text": decision.text[:300],
+                "reason": decision.reason,
+                "confidence": decision.confidence,
+                "raw": decision.raw,
+                "prompt": decision.prompt,
+                "vision": bool(self.cfg.llm.vision and obs.annotated_png),
+            }
         )
         await self.emit(
             "llm",
@@ -426,6 +552,8 @@ class Agent:
         escalated: str | None,
         started: float,
     ) -> None:
+        for number, call in enumerate(self._step_llm, 1):
+            trace.save_prompt(step, number, call.get("prompt") or "")
         record = StepRecord(
             step=step,
             url=obs.url,
@@ -444,7 +572,47 @@ class Agent:
             escalated_to=escalated,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
-        trace.write({"type": "step", **record.to_json()})
+        payload = record.to_json()
+        # The prompt is on disk per step; keep the reply inline, it is what you
+        # actually re-read when a step goes wrong.
+        payload["llm_calls"] = [
+            {k: v for k, v in call.items() if k != "prompt"} for call in self._step_llm
+        ]
+        trace.write({"type": "step", **payload})
+        trace.step_note(payload, self._step_llm)
+
+
+def _coerce_operation(
+    op: str, element, text: str, *, text_is_deliberate: bool = False  # noqa: ANN001
+) -> tuple[str, str | None]:
+    """Match the verb to the element, or say why the LLM should take over.
+
+    Laya answers "which element" and "what to do with it" as two independent
+    questions, so nothing stops it pairing a link with `select`. Playwright
+    then raises - "Element is not a <select> element" - the step fails, and
+    because Laya sees no history it picks the identical pair next step. A real
+    run spent six of its eight steps doing exactly that to eBay's "Deals" link.
+
+    Returns (operation to run, note to escalate with). The note is set only
+    when there is genuinely nothing sensible to do without reasoning.
+    """
+    is_field = element.tag in {"input", "textarea"} or element.role in {
+        "searchbox", "textbox", "combobox",
+    }
+    is_select = element.tag == "select" or element.role == "listbox"
+
+    if op == "click" and is_field and text and text_is_deliberate:
+        # The LLM asked to click a text box and handed over the text to put in
+        # it. Clicking only focuses it, and the text is dropped on the floor.
+        return "type", None
+    if op == "select" and not is_select:
+        return ("type" if is_field and text else "click"), None
+    if op == "type" and not is_field:
+        # Typing into a link or a button means "activate it" often enough.
+        return "click", None
+    if op == "type" and not text:
+        return op, "Laya wants to type here but has no text."
+    return op, None
 
 
 def _as_index(text: str, fallback: int) -> int:

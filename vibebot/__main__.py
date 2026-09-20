@@ -116,6 +116,19 @@ async def _run_once(cfg: Config, goal: str) -> int:
 async def _doctor(cfg: Config) -> int:
     ok = True
 
+    from .sysmem import snapshot
+
+    memory = snapshot()
+    if memory is None:
+        print("memory        : unknown on this platform")
+    else:
+        tight = memory.headroom_mb < cfg.decider.min_headroom_mb
+        print(f"memory        : {'TIGHT' if tight else 'ok'} -> {memory.short()}")
+        if tight:
+            print(f"                below decider.min_headroom_mb ({cfg.decider.min_headroom_mb:,} MB); "
+                  "Laya will be skipped and every step will go to the LLM.")
+            ok = False
+
     try:
         import playwright  # noqa: F401,PLC0415
 

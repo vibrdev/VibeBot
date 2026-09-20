@@ -75,7 +75,8 @@ class OllamaLLM:
         note: str,
         screenshot_png: bytes | None,
     ) -> LLMAction:
-        message = {"role": "user", "content": render_prompt(goal, obs, candidates, history, note)}
+        prompt = render_prompt(goal, obs, candidates, history, note)
+        message = {"role": "user", "content": prompt}
         if self.cfg.vision and screenshot_png:
             message["images"] = [b64(screenshot_png)]
 
@@ -93,8 +94,11 @@ class OllamaLLM:
             return LLMAction(
                 op="ask_user",
                 text=f"My local LLM failed ({exc}).{_next_step(str(exc))} What should I do next?",
+                prompt=prompt,
             )
-        return _finish(parse_action(content), done_reason, self.cfg)
+        action = _finish(parse_action(content), done_reason, self.cfg)
+        action.prompt = prompt
+        return action
 
     async def ask(self, prompt: str) -> str:
         """Free-form question — used for final summaries and done-verification."""
@@ -128,6 +132,7 @@ class OllamaLLM:
         think = {"off": False, "on": True}.get(self.cfg.think)
         send_think = think is not None and self._think_ok is not False
 
+        payload = {**payload, "keep_alive": self.cfg.keep_alive}
         body = {**payload, "think": think} if send_think else payload
         try:
             response = await self._client.post("/api/chat", json=body)
@@ -156,7 +161,26 @@ class OllamaLLM:
         content = (message.get("content") or "").strip()
         return content or (message.get("thinking") or ""), str(data.get("done_reason") or "")
 
+    async def release(self) -> None:
+        """Ask Ollama to unload the model now.
+
+        Measured: qwen3.5:4b holds ~5.7 GB of commit while resident, and
+        Ollama keeps it there for five minutes after the last call. Once a run
+        is over that is five minutes of a 16 GB machine it cannot spend, and
+        the next thing to ask for memory - Laya, on the next run - is the thing
+        that dies when it cannot get it.
+        """
+        try:
+            await self._client.post(
+                "/api/chat",
+                json={"model": self.cfg.model, "messages": [], "keep_alive": 0},
+                timeout=10.0,
+            )
+        except Exception as exc:  # noqa: BLE001 - shutdown must not fail on this
+            log.debug("could not release the model: %s", exc)
+
     async def close(self) -> None:
+        await self.release()
         await self._client.aclose()
 
 

@@ -27,6 +27,21 @@ class BrowserConfig:
     have dozens; each one costs a round trip."""
     follow_new_tabs: bool = True
     """Switch to a tab the page opens, the way a person would."""
+    screenshot_max_width: int = 1024
+    """Downscale screenshots to this width before anything sees them (0 = off).
+
+    Vision models charge by image area. Measured on qwen3.5:4b with the same
+    eBay screenshot, prompt tokens scale almost linearly with width:
+
+        1440x900 -> 1280 tokens, 20.9s
+        1024x640 ->  660 tokens, 17.2s
+         768x480 ->  380 tokens, 16.4s
+         512x320 ->  180 tokens, 16.5s
+
+    At 1440 the image alone eats more than the whole llm.max_tokens budget,
+    which is how a reply ends up truncated before it is valid JSON. It does
+    *not* change how much memory Ollama commits (~5.7 GB at every size above),
+    so this is a token and latency fix, not a memory one."""
 
 
 @dataclass
@@ -37,6 +52,20 @@ class DeciderConfig:
     """auto (Laya Router), or an explicit repo id such as convaiinnovations/laya."""
     device: str = "cpu"
     """cpu | cuda"""
+    preload: bool = False
+    """Load every routed model up front, instead of the one actually used.
+
+    Laya's Router(preload=True) pulls the English *and* multilingual weight
+    sets. Measured here, that is ~2.5 GB of commit charged before the first
+    page is even open, for models an English run never touches. Lazy loading
+    gives identical answers (e0 at p=0.9855 on the same question either way)
+    and pays the load cost once, on the first step that needs it."""
+    min_headroom_mb: int = 3000
+    """Refuse to load the model below this much grantable memory.
+
+    Torch does not raise when the OS declines a commit charge - it dies. A run
+    here segfaulted with no traceback while 7 GB of RAM sat free, because the
+    commit limit had only 2.8 GB left. Better to run degraded and say so."""
     max_candidates: int = 12
     """How many page elements Laya is allowed to choose between. Laya's context is
     512-1024 tokens and its own docs warn about high-cardinality choices, so we
@@ -108,6 +137,14 @@ class LLMConfig:
     temperature: float = 0.1
     timeout_s: float = 180.0
     max_tokens: int = 1024
+    keep_alive: str = "5m"
+    """How long Ollama keeps the model resident between calls.
+
+    Measured: qwen3.5:4b holds ~5.7 GB of commit while loaded, and Ollama's own
+    default keeps it there for 5 minutes after the last call - including the
+    whole time Laya wants memory, and long after a run has finished. VibeBot
+    releases it explicitly on shutdown regardless of this value. Shorten it
+    ("30s", or "0" to unload immediately) to trade reload latency for memory."""
 
 
 @dataclass

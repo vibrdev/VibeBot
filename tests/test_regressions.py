@@ -1,0 +1,153 @@
+"""Regressions for the failures that actually happened on a real run.
+
+Each test here is a bug that was observed in a trace, not a hypothetical.
+Run with: python -m pytest tests -q
+"""
+
+from __future__ import annotations
+
+from vibebot.agent import _coerce_operation
+from vibebot.llm.base import LLMHTTPError, parse_action
+from vibebot.schema import Element
+from vibebot.sysmem import snapshot
+
+LINK = Element(idx=3, tag="a", text="Deals")
+SEARCH = Element(idx=18, tag="input", role="combobox", name="Search for anything")
+DROPDOWN = Element(idx=5, tag="select", role="listbox", name="Sort")
+BUTTON = Element(idx=9, tag="button", text="Search")
+
+
+# --------------------------------------------------------------- element_idx
+
+def test_element_idx_accepts_a_single_item_list():
+    """qwen3.5:4b answered `"element_idx": [18]` having correctly picked eBay's
+    search box. That became None, and the agent scrolled instead."""
+    assert parse_action('{"op":"click","element_idx":[18],"text":"MacBook"}').element_idx == 18
+
+
+def test_element_idx_accepts_the_prompt_s_own_spelling():
+    """The element list is rendered as "e18", so a model may echo it back."""
+    assert parse_action('{"op":"click","element_idx":"e18"}').element_idx == 18
+    assert parse_action('{"op":"click","element_idx":["e18"]}').element_idx == 18
+
+
+def test_element_idx_plain_forms():
+    assert parse_action('{"op":"click","element_idx":18}').element_idx == 18
+    assert parse_action('{"op":"click","element_idx":"18"}').element_idx == 18
+    assert parse_action('{"op":"click","element_idx":18.0}').element_idx == 18
+
+
+def test_element_idx_rejects_what_is_not_an_index():
+    for blob in (
+        '{"op":"click","element_idx":null}',
+        '{"op":"click","element_idx":[3,7]}',      # two choices is not an action
+        '{"op":"click","element_idx":true}',       # bool is an int subclass
+        '{"op":"click","element_idx":"none"}',
+        '{"op":"click","element_idx":{}}',
+    ):
+        assert parse_action(blob).element_idx is None, blob
+
+
+def test_parse_action_keeps_the_raw_reply():
+    action = parse_action('{"op":"click","element_idx":1,"reason":"because"}')
+    assert "element_idx" in action.raw
+
+
+# ----------------------------------------------------------------- operation
+
+def test_select_on_a_link_becomes_click():
+    """Laya answers "which element" and "what to do" separately, so it paired
+    eBay's "Deals" link with `select`. Playwright raised, the step failed, and
+    Laya picked the identical pair for six steps running."""
+    assert _coerce_operation("select", LINK, "anything")[0] == "click"
+    assert _coerce_operation("select", LINK, "")[0] == "click"
+
+
+def test_select_survives_on_a_real_select():
+    assert _coerce_operation("select", DROPDOWN, "Price + shipping")[0] == "select"
+
+
+def test_type_on_a_link_or_button_becomes_click():
+    assert _coerce_operation("type", LINK, "macbook")[0] == "click"
+    assert _coerce_operation("type", BUTTON, "macbook")[0] == "click"
+
+
+def test_type_into_a_field_with_no_text_asks_the_llm():
+    op, note = _coerce_operation("type", SEARCH, "")
+    assert op == "type"
+    assert note  # escalates rather than typing nothing
+
+
+def test_llm_click_with_text_on_a_field_becomes_type():
+    """The LLM asked to click the search box and supplied the query. Clicking
+    only focuses it and the text is dropped."""
+    assert _coerce_operation("click", SEARCH, "MacBook Pro M4", text_is_deliberate=True)[0] == "type"
+
+
+def test_laya_click_with_text_is_left_alone():
+    """Laya always carries a text candidate, so it must not trigger the same
+    coercion — it would type the whole goal into any box it clicked."""
+    assert _coerce_operation("click", SEARCH, "the entire goal string")[0] == "click"
+
+
+def test_llm_click_without_text_stays_a_click():
+    assert _coerce_operation("click", SEARCH, "", text_is_deliberate=True)[0] == "click"
+
+
+# -------------------------------------------------------------------- memory
+
+def test_snapshot_reports_headroom_not_just_free_ram():
+    """Free RAM was the wrong number: torch died with 7 GB free because the
+    commit limit had 2.8 GB left."""
+    memory = snapshot()
+    if memory is None:
+        return  # unsupported platform; nothing to assert
+    assert memory.total_mb > 0
+    assert memory.headroom_mb >= 0
+    assert memory.limit_mb >= memory.committed_mb
+    assert "headroom" in memory.short()
+
+
+def test_llm_http_error_carries_the_status():
+    error = LLMHTTPError("HTTP 500 from 127.0.0.1: out of memory", 500)
+    assert error.status_code == 500
+    assert "out of memory" in str(error)
+
+
+# --------------------------------------------------------------- plausibility
+
+from vibebot.ranking import goal_terms, is_plausible  # noqa: E402
+
+WIKI_GOAL = "go to en.wikipedia.org and find what year the Eiffel Tower was completed"
+WIKI_URL = "https://en.wikipedia.org/wiki/Main_Page"
+EBAY_GOAL = "go to ebay.com and find the cheapest used MacBook Pro M4 listing; report the price"
+EBAY_URL = "https://www.ebay.com/"
+
+
+def test_goal_terms_drop_the_site_you_are_already_on():
+    """"go to en.wikipedia.org ..." otherwise makes every "Wikipedia" link look
+    topical, and a run walked front page -> English Wikipedia -> back."""
+    terms = goal_terms(WIKI_GOAL, WIKI_URL)
+    assert "eiffel" in terms and "tower" in terms
+    assert "wikipedia" not in terms and "org" not in terms
+
+
+def test_off_topic_picks_are_not_plausible():
+    """Every one of these was chosen by Laya at p>=0.74 on a real run."""
+    terms = goal_terms(WIKI_GOAL, WIKI_URL)
+    for text in ("Wikipedia", "English Wikipedia", "Main Page", "Misti as seen from Arequipa"):
+        assert not is_plausible(Element(idx=1, tag="a", text=text), terms), text
+
+    ebay = goal_terms(EBAY_GOAL, EBAY_URL)
+    for text in ("Deals", "My eBay", "Brand Outlet"):
+        assert not is_plausible(Element(idx=1, tag="a", text=text), ebay), text
+
+
+def test_on_topic_and_navigational_picks_are_plausible():
+    terms = goal_terms(WIKI_GOAL, WIKI_URL)
+    assert is_plausible(Element(idx=1, tag="a", text="Eiffel Tower"), terms)
+    assert is_plausible(Element(idx=2, tag="input", role="combobox", name="Search Wikipedia"), terms)
+
+    ebay = goal_terms(EBAY_GOAL, EBAY_URL)
+    assert is_plausible(Element(idx=3, tag="a", text="Apple MacBook Pro M4 14-inch"), ebay)
+    assert is_plausible(Element(idx=4, tag="button", text="Next"), ebay)

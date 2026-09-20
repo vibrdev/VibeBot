@@ -62,6 +62,42 @@ def score_element(el: Element, goal_tokens: set[str], history_tokens: set[str]) 
     return score
 
 
+def goal_terms(goal: str, url: str = "") -> set[str]:
+    """Goal words that actually discriminate between elements on this page."""
+    host = ""
+    if url:
+        match = re.search(r"//([^/?#]+)", url)
+        host = match.group(1) if match else ""
+    return tokens(goal) - tokens(host.replace(".", " "))
+
+
+def is_plausible(el: Element, goal_tokens: set[str]) -> bool:
+    """Could this element have anything to do with the goal?
+
+    Laya reports a calibrated probability over the options it was given, not a
+    judgement about whether any of them is right, so it answers p=1.00 on the
+    best of a bad list. Measured: p=1.00 on eBay's "Deals" link for a laptop
+    search, p=1.00 on the Eiffel Tower *logo* for a question about a date.
+
+    A pick is plausible if it shares a word with the goal, or if it is the kind
+    of control that gets you anywhere at all (a search box, "next", "submit").
+    Anything else Laya is confident about is confidence in a shortlist, and the
+    step is worth an LLM call.
+
+    Pass `goal_tokens` with the current host's own words already removed — see
+    `goal_terms`. "go to en.wikipedia.org and ..." otherwise makes every link
+    reading "Wikipedia" look topical, which is how a run spent three steps
+    walking from the front page to "English Wikipedia" and back.
+    """
+    blob = " ".join([el.text, el.name, el.placeholder, el.value, el.role, el.tag])
+    if goal_tokens & tokens(blob):
+        return True
+    if el.tag in {"input", "textarea"} or el.role in {"searchbox", "textbox", "combobox"}:
+        return True
+    lowered = blob.lower()
+    return any(hint in lowered for hint in _ALWAYS_USEFUL)
+
+
 _COMMAND_PREFIX = re.compile(
     r"^(?:please\s+)?(?:go\s+to|open|visit|search\s+(?:for|on)?|look\s+up|find(?:\s+me)?|"
     r"get(?:\s+me)?|show\s+me|buy|order|book|check)\s+",

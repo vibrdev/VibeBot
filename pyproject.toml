@@ -13,6 +13,7 @@ requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = [
     "playwright>=1.47",
+    "Pillow>=10.0",
     "fastapi>=0.115",
     # [standard] pulls the websockets implementation. The UI talks over a
     # WebSocket, so plain uvicorn serves the page and then refuses the upgrade.
@@ -24,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 laya = ["laya>=0.3.3"]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 vibebot = "vibebot.__main__:main"

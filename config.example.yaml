@@ -11,11 +11,20 @@ browser:
   locale: en-US
   max_frames: 12           # main document + iframes scanned per page
   follow_new_tabs: true    # jump to tabs the page opens, like a person would
+  screenshot_max_width: 1024  # downscale before the model sees it (0 = full size).
+                           # Measured on qwen3.5:4b, same page: 1440px = 1280 image
+                           # tokens, 1024px = 660, 768px = 380. At 1440 the picture
+                           # alone outweighs llm.max_tokens. Does NOT change memory.
 
 decider:
   backend: laya            # laya | jev | heuristic
   model: auto              # auto = Laya's Router; or convaiinnovations/laya[-multilingual]
   device: cpu              # cuda if you have a GPU
+  preload: false           # true loads Laya's multilingual weights too (~2.5 GB of
+                           # commit) for models an English run never touches
+  min_headroom_mb: 3000    # skip Laya below this much *grantable* memory. Torch
+                           # dies rather than raises when the OS declines a commit
+                           # charge, so this trades a segfault for a warning.
   max_candidates: 12       # elements Laya chooses between (its context is small)
   page_text_chars: 600     # page text sent to Laya; lower = faster (200 is snappy)
   accept_probability: 0.55 # p(top option) needed to act without the LLM
@@ -44,6 +53,10 @@ llm:
   temperature: 0.1
   timeout_s: 180
   max_tokens: 1024
+  keep_alive: 5m           # how long Ollama keeps the model resident between calls.
+                           # It holds ~5.7 GB of commit while loaded; VibeBot always
+                           # releases it when a run ends. "30s" or "0" frees it sooner
+                           # at the cost of a reload.
   # Paid alternative (also works for OpenRouter / LM Studio / vLLM / Groq):
   # backend: openai
   # model: gpt-4o-mini

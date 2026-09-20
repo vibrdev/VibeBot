@@ -18,6 +18,7 @@ from playwright.async_api import (
 )
 
 from .config import BrowserConfig
+from .imaging import downscale_png
 from .schema import Element, Observation, TabInfo
 
 log = logging.getLogger(__name__)
@@ -295,7 +296,8 @@ class BrowserSession:
                         annotated.append(frame)
                     except PlaywrightError:
                         continue
-            return await page.screenshot(type="png", full_page=False)
+            shot = await page.screenshot(type="png", full_page=False)
+            return downscale_png(shot, self.cfg.screenshot_max_width)
         except PlaywrightError as exc:
             log.warning("screenshot failed: %s", exc)
             return None
