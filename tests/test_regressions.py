@@ -394,3 +394,105 @@ def test_page_key_keeps_genuinely_different_pages_apart():
 
     assert _page_key("https://ebay.com/a") != _page_key("https://ebay.com/b")
     assert _page_key("https://ebay.com/s?q=one") != _page_key("https://ebay.com/s?q=two")
+
+
+# ------------------------------------------------------ when to interrupt
+
+from vibebot.agent import _is_plain_navigation, _is_search_typing  # noqa: E402
+
+
+def test_a_plain_link_click_is_reversible():
+    """Laya reported risky_p=1.00 for eBay's "Deals" link and 0.98 for
+    "Laptops & Netbooks". Both are category links; Back undoes them."""
+    link = Element(idx=31, tag="a", text="Laptops & Netbooks", href="/b/Laptops/175672")
+    assert _is_plain_navigation(link, "click")
+
+
+def test_a_link_that_is_really_a_button_is_not():
+    """No href, "#" or javascript: means it does something rather than going
+    somewhere, and that something need not be undoable."""
+    for href in ("", "#", "javascript:void(0)"):
+        fake = Element(idx=1, tag="a", text="Delete", href=href)
+        assert not _is_plain_navigation(fake, "click"), href
+
+
+def test_only_clicks_count_as_navigation():
+    link = Element(idx=1, tag="a", text="Next", href="/page/2")
+    assert not _is_plain_navigation(link, "type")
+
+
+def test_typing_a_query_into_search_is_reversible():
+    for element in (
+        Element(idx=1, tag="input", role="searchbox", name="Search"),
+        Element(idx=2, tag="input", input_type="search"),
+        Element(idx=3, tag="input", role="combobox", name="Search for anything"),
+    ):
+        assert _is_search_typing(element, "type")
+
+
+def test_typing_into_an_ordinary_field_is_not():
+    field = Element(idx=9, tag="input", role="textbox", name="Card number")
+    assert not _is_search_typing(field, "type")
+
+
+def test_risky_words_still_win_over_reversibility():
+    """A link labelled "Buy It Now" has an href like any other, so the
+    exemption must not swallow it. The gate checks the keyword first."""
+    from vibebot.config import PolicyConfig
+
+    words = PolicyConfig().risky_keywords
+    for label in ("Buy It Now", "Buy", "Continue with Google", "Accept All"):
+        assert any(w in label.lower() for w in words), label
+
+
+def test_risk_gate_interrupts_for_consequences_not_for_confidence():
+    """The contract, end to end. Laya's risky_p must not be able to stop a
+    reversible action on its own, and must not be needed to stop an
+    irreversible one."""
+    import asyncio
+
+    from vibebot.agent import Agent
+    from vibebot.config import Config
+    from vibebot.schema import Action, Observation
+
+    class FakeBrowser:
+        async def element_is_password(self, idx):
+            return False
+
+    agent = Agent.__new__(Agent)
+    agent.cfg = Config()
+    agent.on_event = lambda event: asyncio.sleep(0)
+    agent._answer = None
+    agent._step_asks = []
+    agent._history = []
+    agent.browser = FakeBrowser()
+    asked: list[str] = []
+
+    async def fake_ask(question):
+        asked.append(question)
+        return "ok"
+
+    agent.ask_user = fake_ask
+
+    def interrupts(element, op, risky):
+        asked.clear()
+        obs = Observation(url="https://www.ebay.com/", title="t", elements=[element])
+        action = Action(op=op, element_idx=element.idx, text="q" if op == "type" else "",
+                        reason="laya", source="laya", risky=risky)
+        asyncio.run(agent._risk_gate(action, obs))
+        return bool(asked)
+
+    # Harmless, however sure Laya is that it is not.
+    assert not interrupts(Element(idx=31, tag="a", text="Laptops & Netbooks", href="/b/x"), "click", 0.98)
+    assert not interrupts(Element(idx=3, tag="a", text="Deals", href="/deals"), "click", 1.00)
+    assert not interrupts(Element(idx=20, tag="input", role="combobox", name="Search for anything"), "type", 1.00)
+
+    # Consequential, however sure Laya is that it is not.
+    assert interrupts(Element(idx=61, tag="a", text="Buy It Now", href="/itm/1"), "click", 0.10)
+    assert interrupts(Element(idx=6, tag="button", text="Accept All"), "click", 0.10)
+    assert interrupts(Element(idx=7, tag="a", text="Continue with Google", href="/oauth"), "click", 0.10)
+
+    # Not a plain navigation, so risky_p still gets to speak.
+    assert interrupts(Element(idx=1, tag="input", input_type="checkbox"), "click", 0.87)
+    assert interrupts(Element(idx=9, tag="input", role="textbox", name="Card number"), "type", 0.87)
+    assert interrupts(Element(idx=4, tag="a", text="Remove", href="javascript:void(0)"), "click", 0.80)
