@@ -186,8 +186,31 @@ def create_app(cfg: Config) -> FastAPI:
     return app
 
 
+def _websocket_support() -> str:
+    """Which WebSocket implementation uvicorn can use, if any.
+
+    The UI is a WebSocket client, and plain `uvicorn` ships without a WS
+    implementation: it serves the page, refuses the upgrade with "Unsupported
+    upgrade request", and the UI sits there dead. Worth catching at startup
+    rather than in the browser console.
+    """
+    for module in ("websockets", "wsproto"):
+        try:
+            __import__(module)
+        except ImportError:
+            continue
+        return module
+    return ""
+
+
 def serve(cfg: Config) -> None:
     import uvicorn
+
+    if not _websocket_support():
+        raise SystemExit(
+            "No WebSocket library installed, so the UI would load and then never connect.\n"
+            "  Fix: pip install 'uvicorn[standard]'   (or: pip install websockets)"
+        )
 
     if cfg.server.host not in {"127.0.0.1", "localhost"} and not cfg.server.token:
         raise SystemExit(

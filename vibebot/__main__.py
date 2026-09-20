@@ -124,6 +124,15 @@ async def _doctor(cfg: Config) -> int:
         print("playwright    : MISSING  -> pip install playwright && playwright install chromium")
         ok = False
 
+    from .server import _websocket_support
+
+    ws = _websocket_support()
+    if ws:
+        print(f"websockets    : {ws} (UI can connect)")
+    else:
+        print("websockets    : MISSING  -> pip install 'uvicorn[standard]'  (UI loads but never connects)")
+        ok = False
+
     from .deciders import build_decider
 
     decider = build_decider(cfg.decider)
