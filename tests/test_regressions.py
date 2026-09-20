@@ -205,3 +205,75 @@ def test_server_defaults_are_one_double_click():
     cfg = Config()
     assert cfg.server.open_browser is True
     assert cfg.server.pid_file.endswith("server.pid")
+
+
+# ------------------------------------------------------------------- the UI
+
+import re  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+
+import pytest  # noqa: E402
+
+UI_HTML = Path(__file__).resolve().parent.parent / "vibebot" / "ui" / "index.html"
+
+
+def _script_source() -> str:
+    html = UI_HTML.read_text(encoding="utf-8")
+    blocks = re.findall(r"<script[^>]*>(.*?)</script>", html, re.S)
+    assert blocks, "the UI has no script block"
+    return "\n".join(blocks)
+
+
+def test_ui_javascript_parses():
+    """A syntax error in the page is invisible from Python and total from the
+    user's side: the socket never opens, the status pill sits on
+    "connecting...", and every button does nothing. That shipped once, when a
+    confirm() message picked up real newlines inside a string literal.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed; cannot parse-check the UI")
+    with tempfile.TemporaryDirectory() as folder:
+        js = Path(folder) / "ui.js"
+        js.write_text(_script_source(), encoding="utf-8")
+        result = subprocess.run(
+            [node, "--check", str(js)], capture_output=True, text=True, timeout=60
+        )
+    assert result.returncode == 0, f"UI JavaScript does not parse:\n{result.stderr}"
+
+
+def test_ui_string_literals_stay_on_one_line():
+    """The specific failure above, catchable without node.
+
+    Walks the script tracking quote state. A ' or " literal left open at the
+    end of a line is the bug that shipped; backticks may legitimately span
+    lines, so they carry over.
+    """
+    backslash = chr(92)
+    in_template = False
+    for number, line in enumerate(_script_source().splitlines(), 1):
+        quote = "`" if in_template else ""
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if quote:
+                if char == backslash:
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = ""
+            elif char in "'" + chr(34) + "`":
+                quote = char
+            elif char == "/" and line[index : index + 2] == "//":
+                break
+            index += 1
+        assert quote in ("", "`"), f"unterminated {quote} string on script line {number}: {line!r}"
+        in_template = quote == "`"
+
+
+def test_ui_still_wires_up_its_controls():
+    source = _script_source()
+    for handler in ("$('go').onclick", "$('stop').onclick", "$('quit').onclick", "function connect("):
+        assert handler in source, f"{handler} is missing from the UI"
