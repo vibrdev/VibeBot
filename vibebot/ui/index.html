@@ -260,9 +260,7 @@ $('go').onclick = () => { const g = $('goal').value.trim(); if (g) { feed.innerH
 $('goal').onkeydown = (e) => { if (e.key === 'Enter') $('go').click(); };
 $('stop').onclick = () => send({ type: 'stop' });
 $('quit').onclick = () => {
-  if (!confirm('Shut VibeBot down completely?
-
-This closes the browser it drives and stops the server.')) return;
+  if (!confirm('Shut VibeBot down completely? This closes the browser it drives and stops the server.')) return;
   quitting = true;
   send({ type: 'quit' });
   // The socket dies with the server, so show the notice either way.
