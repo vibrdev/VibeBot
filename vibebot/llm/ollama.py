@@ -12,13 +12,19 @@ from .base import LLMAction, SYSTEM_PROMPT, b64, parse_action, render_prompt
 
 log = logging.getLogger(__name__)
 
+#: Used when `llm.base_url` is empty. Each backend brings its own default so
+#: that changing `llm.backend` alone cannot leave you pointed at the other
+#: backend's port.
+DEFAULT_BASE_URL = "http://127.0.0.1:11434"
+
 
 class OllamaLLM:
     name = "ollama"
 
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
-        self._client = httpx.AsyncClient(base_url=cfg.base_url.rstrip("/"), timeout=cfg.timeout_s)
+        self.base_url = (cfg.base_url or DEFAULT_BASE_URL).rstrip("/")
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=cfg.timeout_s)
         self._checked = False
         self._ok = False
         #: None until we learn whether this server accepts the `think` field.
@@ -32,7 +38,7 @@ class OllamaLLM:
         except Exception as exc:  # noqa: BLE001
             self._checked, self._ok = True, False
             return False, (
-                f"Ollama not reachable at {self.cfg.base_url} ({exc}). "
+                f"Ollama not reachable at {self.base_url} ({exc}). "
                 "Install from https://ollama.com and start it."
             )
         pulled = {_tagged(m.get("name", "")) for m in response.json().get("models", [])}

@@ -63,6 +63,11 @@ class LLM(Protocol):
 
     def available(self) -> bool: ...
 
+    async def ping(self) -> tuple[bool, str]:
+        """(usable, human-readable reason). `vibebot doctor` and Agent.start
+        both call this, so it belongs in the contract."""
+        ...
+
     async def decide(
         self,
         goal: str,
@@ -72,6 +77,8 @@ class LLM(Protocol):
         note: str,
         screenshot_png: bytes | None,
     ) -> LLMAction: ...
+
+    async def ask(self, prompt: str) -> str: ...
 
     async def close(self) -> None: ...
 

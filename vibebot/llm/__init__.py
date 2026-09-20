@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from ..config import LLMConfig
+from ..config import LLM_BACKENDS, LLMConfig
 from .base import LLM, LLMAction, parse_action
 from .ollama import OllamaLLM
 from .openai_compat import OpenAICompatLLM
 
-__all__ = ["LLM", "LLMAction", "NullLLM", "OllamaLLM", "OpenAICompatLLM", "build_llm", "parse_action"]
-
+__all__ = [
+    "LLM",
+    "LLMAction",
+    "NullLLM",
+    "OllamaLLM",
+    "OpenAICompatLLM",
+    "build_llm",
+    "parse_action",
+]
 
 class NullLLM:
-    """No reasoning layer — every escalation goes straight to the human."""
+    """No reasoning layer - every escalation goes straight to the human."""
 
     name = "none"
 
@@ -32,9 +39,20 @@ class NullLLM:
 
 
 def build_llm(cfg: LLMConfig):
-    backend = (cfg.backend or "ollama").lower()
-    if backend in {"none", "off", "disabled"}:
+    """Build the backend named in `llm.backend`.
+
+    Raises ValueError on an unknown name. The previous version treated
+    anything unrecognised as "ollama", so `backend: anthropic` - or a plain
+    typo - silently ran every escalation against localhost while the config
+    said otherwise. A wrong route that still works is the expensive kind.
+    """
+    name = (cfg.backend or "ollama").strip().lower()
+    kind = LLM_BACKENDS.get(name)
+    if kind is None:
+        valid = ", ".join(sorted(set(LLM_BACKENDS)))
+        raise ValueError(f"llm.backend: unknown value {cfg.backend!r}. Valid values: {valid}")
+    if kind == "none":
         return NullLLM()
-    if backend in {"openai", "openai_compat", "openrouter", "lmstudio", "vllm"}:
+    if kind == "openai":
         return OpenAICompatLLM(cfg)
     return OllamaLLM(cfg)

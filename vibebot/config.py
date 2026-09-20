@@ -61,6 +61,28 @@ class DeciderConfig:
     jev_api_key_env: str = "JEV_API_KEY"
 
 
+#: Every accepted `llm.backend` value -> the implementation it selects.
+#: Spelled out on purpose: an unknown name is a configuration error, not a
+#: reason to quietly pick something. `vibebot.llm.build_llm` routes on this.
+LLM_BACKENDS: dict[str, str] = {
+    "ollama": "ollama",
+    "openai": "openai",
+    "openai_compat": "openai",
+    "openai-compat": "openai",
+    "openrouter": "openai",
+    "lmstudio": "openai",
+    "lm_studio": "openai",
+    "vllm": "openai",
+    "llamacpp": "openai",
+    "llama_cpp": "openai",
+    "groq": "openai",
+    "together": "openai",
+    "none": "none",
+    "off": "none",
+    "disabled": "none",
+}
+
+
 @dataclass
 class LLMConfig:
     backend: str = "ollama"
@@ -75,7 +97,11 @@ class LLMConfig:
     support it, and a thinking model puts its answer in `message.thinking`
     while `content` comes back empty — which reads as a broken model. We send
     `think: false` unless told otherwise. `auto` omits the field entirely."""
-    base_url: str = "http://127.0.0.1:11434"
+    base_url: str = ""
+    """Empty means "whatever this backend's default is" - http://127.0.0.1:11434
+    for ollama, https://api.openai.com for openai. Do not hard-code one backend's
+    URL here: `backend: openai` inheriting Ollama's port used to report ready and
+    then talk to localhost, because Ollama answers /v1/chat/completions too."""
     api_key_env: str = "OPENAI_API_KEY"
     vision: bool = True
     """Send annotated screenshots. Turn off for text-only models."""
@@ -147,8 +173,19 @@ class Config:
 
         `think: off` parses as the boolean False under YAML 1.1 (the same rule
         that turns Norway's `no` into False), which would silently skip the
-        `think` field and leave thinking switched on. Accept every spelling."""
+        `think` field and leave thinking switched on. Accept every spelling.
+
+        Also rejects an unroutable `llm.backend` here rather than at the first
+        escalation, so a typo is a startup error instead of a silent reroute."""
         self.llm.think = _tristate(self.llm.think)
+        self._validate_backends()
+
+    def _validate_backends(self) -> None:
+        name = str(self.llm.backend or "ollama").strip().lower()
+        if name not in LLM_BACKENDS:
+            valid = ", ".join(sorted(set(LLM_BACKENDS)))
+            raise ValueError(f"llm.backend: unknown value {self.llm.backend!r}. Valid values: {valid}")
+        self.llm.backend = name
 
     def _apply_env(self) -> None:
         """VIBEBOT_<SECTION>_<FIELD> overrides anything from the YAML file."""

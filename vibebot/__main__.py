@@ -39,7 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    cfg = Config.load(args.config)
+    try:
+        cfg = Config.load(args.config)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
 
     if args.command == "run":
         if args.headless:

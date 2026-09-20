@@ -28,20 +28,26 @@ decider:
   # jev_api_key_env: JEV_API_KEY
 
 llm:
-  backend: ollama          # ollama | openai | none
+  backend: ollama          # ollama | openai | none. An unknown value is a
+                           # startup error, not a silent fall back to ollama.
   model: qwen3.5:4b        # ollama pull qwen3.5:4b (3.4 GB, vision included)
                            # more VRAM -> qwen3.5:9b, less -> :2b or :0.8b
   think: off               # off | on | auto. Thinking is on by default in
                            # Ollama and hides the answer in message.thinking.
-  base_url: http://127.0.0.1:11434
+  base_url: ""             # empty = this backend's own default
+                           # (ollama -> http://127.0.0.1:11434,
+                           #  openai -> https://api.openai.com).
+                           # Leave it empty unless you are pointing somewhere
+                           # else: a base_url left over from the other backend
+                           # is the classic "why is it calling localhost" bug.
   vision: true             # send annotated screenshots (needs a vision model)
   temperature: 0.1
   timeout_s: 180
   max_tokens: 1024
-  # Paid alternative (also works for OpenRouter / LM Studio / vLLM):
+  # Paid alternative (also works for OpenRouter / LM Studio / vLLM / Groq):
   # backend: openai
   # model: gpt-4o-mini
-  # base_url: https://api.openai.com
+  # base_url: ""           # or https://openrouter.ai/api, http://127.0.0.1:1234, ...
   # api_key_env: OPENAI_API_KEY
 
 policy:

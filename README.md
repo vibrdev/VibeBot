@@ -152,6 +152,15 @@ Set `llm.model` to anything Ollama serves, or point `llm.backend: openai` at a
 hosted endpoint. Whatever you pick needs **vision**, or set `llm.vision: false`
 and it runs on the element list alone (worse, but it works).
 
+`llm.base_url` defaults to whichever URL the chosen backend needs, so switching
+`llm.backend` is a one-line change. Set it only to point somewhere unusual — an
+OpenRouter URL, LM Studio on another port, Ollama on another host. Leaving one
+backend's URL behind when you switch to the other is the failure this defaults
+to avoiding: Ollama also answers `/v1/chat/completions`, so `backend: openai`
+aimed at port 11434 does not error, it just quietly runs locally. `vibebot
+doctor` now calls that out, along with a missing API key on *any* hosted
+provider and a `model` the endpoint does not serve.
+
 **Thinking models need `llm.think: off`, which is the default.** Ollama turns
 thinking *on* by default for models that support it, and a thinking model puts
 its answer in `message.thinking` while `content` comes back empty — which looks
@@ -215,6 +224,7 @@ decider:
 
 llm:
   backend: openai          # also OpenRouter, LM Studio, vLLM, llama.cpp
+                           # an unknown backend name is a startup error
   model: gpt-4o-mini
   base_url: https://api.openai.com
   api_key_env: OPENAI_API_KEY
