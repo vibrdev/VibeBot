@@ -9,6 +9,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import httpx
+
 from ..schema import Element, Observation
 
 log = logging.getLogger(__name__)
@@ -219,3 +221,55 @@ def _repair(blob: str, depth: int, in_string: bool) -> str | None:
 
 def b64(png: bytes) -> str:
     return base64.b64encode(png).decode("ascii")
+
+
+class LLMHTTPError(RuntimeError):
+    """An HTTP error that still carries the server's own explanation."""
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def raise_for_status(response: httpx.Response) -> None:
+    """Like `response.raise_for_status()`, but keeps the body.
+
+    httpx renders a failed response as nothing but its status line and a link
+    to MDN, so a model that fails to load reached the user as a bare "Server
+    error '500 Internal Server Error'" with nothing to act on. Everything
+    useful is in the body.
+
+    Measured against Ollama 0.34.2, a load that runs out of memory answers:
+
+        {"error": "llama-server startup failed after projector CPU offload
+                   retry: ... cudaMalloc failed: out of memory ..."}
+
+    OpenAI-compatible servers nest the same thing one level down, under
+    {"error": {"message": ...}}, so both shapes are unwrapped here.
+    """
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = _detail(response)
+        host = response.request.url.host
+        message = f"HTTP {response.status_code} from {host}"
+        raise LLMHTTPError(f"{message}: {detail}" if detail else message, response.status_code) from exc
+
+
+def _detail(response: httpx.Response, limit: int = 400) -> str:
+    """The server's explanation, as one line short enough to show a user."""
+    text = ""
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - error bodies are not always JSON
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error", payload)
+        if isinstance(error, dict):
+            error = error.get("message") or error.get("error") or ""
+        if isinstance(error, str):
+            text = error
+    if not text.strip():
+        text = response.text or ""
+    text = " ".join(text.split())
+    return text[: limit - 1] + "…" if len(text) > limit else text

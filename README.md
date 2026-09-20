@@ -148,6 +148,14 @@ tab" is a choice Laya can make by itself. It refuses to close the last tab.
 | `qwen3.5:2b` | 2.7 GB | 6 GB VRAM | still sees, noticeably dimmer |
 | `qwen3.5:0.8b` | 1.0 GB | 4 GB VRAM | last resort; expect more `ask_user` |
 
+"Fits" is VRAM. What does not fit is pinned in **system RAM**, so a card
+smaller than the column above still works — as long as the rest of the machine
+leaves the difference free. On a 4 GB card, `qwen3.5:4b` pins roughly 1.8 GB of
+host RAM, and the browser window this agent opens is itself the hungriest thing
+on the box. Run out and Ollama answers `500` on every step, which VibeBot now
+reports with Ollama's own words ("out of memory") instead of a bare status code.
+Close other apps, set `llm.vision: false`, or drop a size.
+
 Set `llm.model` to anything Ollama serves, or point `llm.backend: openai` at a
 hosted endpoint. Whatever you pick needs **vision**, or set `llm.vision: false`
 and it runs on the element list alone (worse, but it works).
@@ -164,7 +172,9 @@ provider and a `model` the endpoint does not serve.
 **Thinking models need `llm.think: off`, which is the default.** Ollama turns
 thinking *on* by default for models that support it. We send `think: false`,
 fall back to reading `message.thinking` if a model ignores that, and retry
-without the field on servers that reject it. Set `on` if you want the reasoning,
+without the field when a server answers **400** to it (only a 400 — a 500 is the
+server failing for some other reason, and treating that as a rejection used to
+switch thinking back on for the rest of the run). Set `on` if you want the reasoning,
 `auto` to leave it to the server.
 
 Measured on qwen3.5:4b, not inherited from the vendor README:

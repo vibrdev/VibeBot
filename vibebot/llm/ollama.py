@@ -8,7 +8,15 @@ import httpx
 
 from ..config import LLMConfig
 from ..schema import Element, Observation
-from .base import LLMAction, SYSTEM_PROMPT, b64, parse_action, render_prompt
+from .base import (
+    LLMAction,
+    LLMHTTPError,
+    SYSTEM_PROMPT,
+    b64,
+    parse_action,
+    raise_for_status,
+    render_prompt,
+)
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +42,7 @@ class OllamaLLM:
         """Check the daemon is up and the model is pulled, with a useful message."""
         try:
             response = await self._client.get("/api/tags", timeout=5.0)
-            response.raise_for_status()
+            raise_for_status(response)
         except Exception as exc:  # noqa: BLE001
             self._checked, self._ok = True, False
             return False, (
@@ -82,7 +90,10 @@ class OllamaLLM:
             content, done_reason = await self._chat(payload)
         except Exception as exc:  # noqa: BLE001
             log.warning("ollama call failed: %s", exc)
-            return LLMAction(op="ask_user", text=f"My local LLM failed ({exc}). What should I do next?")
+            return LLMAction(
+                op="ask_user",
+                text=f"My local LLM failed ({exc}).{_next_step(str(exc))} What should I do next?",
+            )
         return _finish(parse_action(content), done_reason, self.cfg)
 
     async def ask(self, prompt: str) -> str:
@@ -106,11 +117,13 @@ class OllamaLLM:
         which is not the same failure as a model that answered badly, and only
         one of the two is fixed by raising llm.max_tokens.
 
-        Handles two thinking-model traps. First, servers that reject the
-        `think` field are retried once without it, and we remember. Second, a
-        model that thinks anyway leaves `content` empty and puts everything in
-        `thinking`, so we fall back to that rather than reporting a blank reply
-        — parse_action digs the JSON out either way.
+        Handles two thinking-model traps. First, a server that answers 400
+        because it will not take the `think` field is retried once without it,
+        and we remember — but only on a 400, so an unrelated failure cannot
+        turn thinking back on behind our back. Second, a model that thinks
+        anyway leaves `content` empty and puts everything in `thinking`, so we
+        fall back to that rather than reporting a blank reply — parse_action
+        digs the JSON out either way.
         """
         think = {"off": False, "on": True}.get(self.cfg.think)
         send_think = think is not None and self._think_ok is not False
@@ -118,14 +131,22 @@ class OllamaLLM:
         body = {**payload, "think": think} if send_think else payload
         try:
             response = await self._client.post("/api/chat", json=body)
-            response.raise_for_status()
-        except httpx.HTTPStatusError:
-            if not send_think:
+            raise_for_status(response)
+        except LLMHTTPError as exc:
+            # Only 400 means "this server will not take `think`". Measured on
+            # Ollama 0.34.2: `think: true` against a model without the
+            # capability answers 400 '"gemma3:1b" does not support thinking',
+            # while `think: false` answers 200. A 500 is the server failing to
+            # serve at all - most often the model not fitting in memory - so
+            # retrying without `think` cannot fix it, and remembering a
+            # rejection that never happened would silently turn thinking back
+            # on for the rest of the run and eat the token budget.
+            if not send_think or exc.status_code != 400:
                 raise
             log.info("server rejected the 'think' field; retrying without it")
             self._think_ok = False
             response = await self._client.post("/api/chat", json=payload)
-            response.raise_for_status()
+            raise_for_status(response)
         else:
             if send_think:
                 self._think_ok = True
@@ -162,6 +183,25 @@ def _finish(action: LLMAction, done_reason: str, cfg: LLMConfig) -> LLMAction:
             cfg.max_tokens, action.op,
         )
     return action
+
+
+def _next_step(message: str) -> str:
+    """Name the fix when the server's reason is one we recognise.
+
+    Measured on this repo's default setup - qwen3.5:4b, 4 GB RTX 3050 Ti, 16 GB
+    RAM - with the browser window open and Laya resident on the CPU, Ollama had
+    ~1 GB of host RAM free and could not pin the ~1.8 GB of model that does not
+    fit in VRAM. /api/chat answered 500 for every step of the run; the same
+    request succeeded once the browser was closed.
+    """
+    low = message.lower()
+    if "out of memory" in low or "allocate" in low:
+        return (
+            " Ollama ran out of memory loading the model, so this is about the machine, not the"
+            " page: close other apps (the browser window this run opened is usually the biggest),"
+            " or set llm.vision: false, or drop to a smaller llm.model such as qwen3.5:2b."
+        )
+    return ""
 
 
 def _tagged(name: str) -> str:
