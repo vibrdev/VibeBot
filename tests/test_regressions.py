@@ -277,3 +277,59 @@ def test_ui_still_wires_up_its_controls():
     source = _script_source()
     for handler in ("$('go').onclick", "$('stop').onclick", "$('quit').onclick", "function connect("):
         assert handler in source, f"{handler} is missing from the UI"
+
+
+# --------------------------------------------------- how often Laya may act
+
+from vibebot.agent import _offtopic_and_unsure  # noqa: E402
+
+SHOPPING = goal_terms(
+    "find, dont buy, FIND the cheapest second hand macbook pro m4 on the market",
+    "https://www.google.com/search",
+)
+
+
+def test_a_confident_pick_acts_even_when_the_words_do_not_match():
+    """The regression the user hit: Laya wanted "For Sale" at p=0.91 on a page
+    of shopping results, the gate escalated because the label shares no word
+    with the goal, and the LLM clicked "Store" instead. Three runs in a row
+    reached 0% Laya."""
+    for_sale = Element(idx=32, tag="link", text="For Sale")
+    assert not is_plausible(for_sale, SHOPPING), "precondition: the words do not match"
+    assert not _offtopic_and_unsure(for_sale, SHOPPING, p_top=0.91, trust=0.85)
+
+
+def test_a_vague_offtopic_pick_still_escalates():
+    vague = Element(idx=9, tag="a", text="Help & Contact")
+    assert _offtopic_and_unsure(vague, SHOPPING, p_top=0.60, trust=0.85)
+
+
+def test_an_ontopic_pick_acts_at_any_confidence():
+    listing = Element(idx=5, tag="a", text="Apple MacBook Pro M4 refurbished")
+    assert not _offtopic_and_unsure(listing, SHOPPING, p_top=0.60, trust=0.85)
+
+
+def test_trust_threshold_is_configurable_and_sane():
+    from vibebot.config import DeciderConfig
+
+    assert 0.5 < DeciderConfig().trust_confidence < 1.0
+
+
+# ----------------------------------------------------------- consent / auth
+
+def test_consent_and_signin_buttons_count_as_risky():
+    """A run clicked "Accept All" on a cookie banner and then "Continue with
+    Google", landing on account creation. Neither label contains "sign in"."""
+    from vibebot.config import PolicyConfig
+
+    words = PolicyConfig().risky_keywords
+    for label in ("Accept All", "Continue with Google", "Agree", "Sign up", "Create account"):
+        assert any(word in label.lower() for word in words), label
+
+
+def test_ordinary_buttons_are_not_risky():
+    from vibebot.config import PolicyConfig
+
+    words = PolicyConfig().risky_keywords
+    for label in ("Search", "Next page", "Used (387) Items", "Price + Shipping: lowest first"):
+        assert not any(word in label.lower() for word in words), label

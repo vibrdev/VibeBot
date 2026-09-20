@@ -60,6 +60,14 @@ class DeciderConfig:
     page is even open, for models an English run never touches. Lazy loading
     gives identical answers (e0 at p=0.9855 on the same question either way)
     and pays the load cost once, on the first step that needs it."""
+    trust_confidence: float = 0.85
+    """Above this, Laya acts even on an element unrelated to the goal's wording.
+
+    The relatedness check earns its keep on vague picks, but it reads only the
+    words: "For Sale" on a page of shopping results shares nothing with "find
+    the cheapest second hand macbook pro m4", and Laya wanted it at p=0.91.
+    Escalating that traded a good decision for a worse one - the LLM clicked
+    "Store" instead. Off-topic *and* hesitant is the combination worth a call."""
     min_headroom_mb: int = 3000
     """Refuse to load the model below this much grantable memory.
 
@@ -163,6 +171,13 @@ class PolicyConfig:
             "buy", "purchase", "checkout", "pay", "order", "subscribe",
             "delete", "remove", "cancel", "send", "post", "publish", "tweet",
             "transfer", "withdraw", "confirm", "sign in", "log in", "password",
+            # Consent and identity, added after a run clicked "Accept All" on a
+            # cookie banner and then "Continue with Google", which put it two
+            # steps into creating a Google account. Agreeing to terms and
+            # handing over an identity are decisions with consequences outside
+            # the page, and neither one contains the word "sign in".
+            "accept all", "accept cookies", "agree", "consent",
+            "continue with", "sign up", "register", "create account",
         ]
     )
     never_type_into_password: bool = True
