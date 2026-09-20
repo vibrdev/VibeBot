@@ -33,12 +33,17 @@ class OllamaLLM:
                 f"Ollama not reachable at {self.cfg.base_url} ({exc}). "
                 "Install from https://ollama.com and start it."
             )
-        names = {m.get("name", "") for m in response.json().get("models", [])}
-        base = {n.split(":")[0] for n in names}
+        pulled = {_tagged(m.get("name", "")) for m in response.json().get("models", [])}
         wanted = self.cfg.model
-        if wanted not in names and wanted.split(":")[0] not in base:
+        if _tagged(wanted) not in pulled:
+            # Matching on the family name alone would pass ':70b' just because
+            # ':8b' is present, and the run would then die mid-goal. Ollama
+            # itself resolves tags exactly, so we do too.
+            family = wanted.split(":")[0]
+            near = sorted(n for n in pulled if n.split(":")[0] == family)
+            hint = f" (you have: {', '.join(near)})" if near else ""
             self._checked, self._ok = True, False
-            return False, f"Model '{wanted}' is not pulled. Run: ollama pull {wanted}"
+            return False, f"Model '{wanted}' is not pulled{hint}. Run: ollama pull {wanted}"
         self._checked, self._ok = True, True
         return True, f"Ollama ready ({wanted})"
 
@@ -91,3 +96,8 @@ class OllamaLLM:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+def _tagged(name: str) -> str:
+    """Ollama treats a bare name as ':latest'; compare like for like."""
+    return name if ":" in name else f"{name}:latest"

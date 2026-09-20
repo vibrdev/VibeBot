@@ -29,7 +29,8 @@ decider:
 
 llm:
   backend: ollama          # ollama | openai | none
-  model: qwen2.5vl:7b      # any vision model: ollama pull qwen2.5vl:7b
+  model: qwen3-vl:8b       # ollama pull qwen3-vl:8b (6.1 GB)
+                           # 8 GB VRAM -> qwen3-vl:4b, less -> qwen3-vl:2b
   base_url: http://127.0.0.1:11434
   vision: true             # send annotated screenshots (needs a vision model)
   temperature: 0.1
