@@ -65,11 +65,16 @@ class DeciderConfig:
 class LLMConfig:
     backend: str = "ollama"
     """ollama | openai | none"""
-    model: str = "qwen3-vl:8b"
-    """Any vision model Ollama serves. qwen3-vl is the current default because
-    its family is the documented one for GUI-agent work; not benchmarked in this
-    repo, so treat it as a sane starting point rather than a measured winner.
-    Drop to qwen3-vl:4b on 8 GB of VRAM, or :2b on less."""
+    model: str = "qwen3.5:4b"
+    """Any vision model Ollama serves. qwen3.5 is natively multimodal at every
+    size, so 4b (3.4 GB) buys vision on a modest card; go up to :9b if you have
+    the VRAM, down to :2b or :0.8b if you do not. Not benchmarked in this repo —
+    a sane starting point, not a measured winner."""
+    think: str = "off"
+    """off | on | auto. Thinking is ON by default in Ollama for models that
+    support it, and a thinking model puts its answer in `message.thinking`
+    while `content` comes back empty — which reads as a broken model. We send
+    `think: false` unless told otherwise. `auto` omits the field entirely."""
     base_url: str = "http://127.0.0.1:11434"
     api_key_env: str = "OPENAI_API_KEY"
     vision: bool = True
@@ -132,8 +137,18 @@ class Config:
                 raw = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
                 _merge(cfg, raw)
                 break
+        cfg._normalize()   # before env, so _coerce sees a str and not a bool
         cfg._apply_env()
+        cfg._normalize()
         return cfg
+
+    def _normalize(self) -> None:
+        """Repair values YAML mangles.
+
+        `think: off` parses as the boolean False under YAML 1.1 (the same rule
+        that turns Norway's `no` into False), which would silently skip the
+        `think` field and leave thinking switched on. Accept every spelling."""
+        self.llm.think = _tristate(self.llm.think)
 
     def _apply_env(self) -> None:
         """VIBEBOT_<SECTION>_<FIELD> overrides anything from the YAML file."""
@@ -166,6 +181,18 @@ def _merge(target: Any, raw: dict[str, Any]) -> None:
             _merge(current, value)
         elif value is not None:
             setattr(target, key, value)
+
+
+def _tristate(value: Any) -> str:
+    """Anything that means off/on/auto -> "off" | "on" | "auto"."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    text = str(value).strip().lower()
+    if text in {"off", "false", "no", "0", "none", ""}:
+        return "off"
+    if text in {"on", "true", "yes", "1"}:
+        return "on"
+    return "auto"
 
 
 def _coerce(text: str, like: Any) -> Any:

@@ -21,6 +21,8 @@ class OllamaLLM:
         self._client = httpx.AsyncClient(base_url=cfg.base_url.rstrip("/"), timeout=cfg.timeout_s)
         self._checked = False
         self._ok = False
+        #: None until we learn whether this server accepts the `think` field.
+        self._think_ok: bool | None = None
 
     async def ping(self) -> tuple[bool, str]:
         """Check the daemon is up and the model is pulled, with a useful message."""
@@ -71,9 +73,7 @@ class OllamaLLM:
             "options": {"temperature": self.cfg.temperature, "num_predict": self.cfg.max_tokens},
         }
         try:
-            response = await self._client.post("/api/chat", json=payload)
-            response.raise_for_status()
-            content = response.json().get("message", {}).get("content", "")
+            content = await self._chat(payload)
         except Exception as exc:  # noqa: BLE001
             log.warning("ollama call failed: %s", exc)
             return LLMAction(op="ask_user", text=f"My local LLM failed ({exc}). What should I do next?")
@@ -88,11 +88,40 @@ class OllamaLLM:
             "options": {"temperature": self.cfg.temperature},
         }
         try:
-            response = await self._client.post("/api/chat", json=payload)
-            response.raise_for_status()
-            return response.json().get("message", {}).get("content", "").strip()
+            return (await self._chat(payload)).strip()
         except Exception as exc:  # noqa: BLE001
             return f"(summary unavailable: {exc})"
+
+    async def _chat(self, payload: dict) -> str:
+        """POST /api/chat and return the model's answer text.
+
+        Handles two thinking-model traps. First, servers that reject the
+        `think` field are retried once without it, and we remember. Second, a
+        model that thinks anyway leaves `content` empty and puts everything in
+        `thinking`, so we fall back to that rather than reporting a blank reply
+        — parse_action digs the JSON out either way.
+        """
+        think = {"off": False, "on": True}.get(self.cfg.think)
+        send_think = think is not None and self._think_ok is not False
+
+        body = {**payload, "think": think} if send_think else payload
+        try:
+            response = await self._client.post("/api/chat", json=body)
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            if not send_think:
+                raise
+            log.info("server rejected the 'think' field; retrying without it")
+            self._think_ok = False
+            response = await self._client.post("/api/chat", json=payload)
+            response.raise_for_status()
+        else:
+            if send_think:
+                self._think_ok = True
+
+        message = response.json().get("message", {}) or {}
+        content = (message.get("content") or "").strip()
+        return content or (message.get("thinking") or "")
 
     async def close(self) -> None:
         await self._client.aclose()

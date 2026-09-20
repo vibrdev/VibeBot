@@ -44,7 +44,7 @@ pip install laya                 # the decision model (pulls torch, ~2.5 GB)
 
 # the reasoning model
 winget install Ollama.Ollama
-ollama pull qwen3-vl:8b          # 6.1 GB; see "Choosing the LLM" below
+ollama pull qwen3.5:4b           # 3.4 GB; see "Choosing the LLM" below
 
 copy config.example.yaml config.yaml
 python -m vibebot doctor         # checks all four pieces
@@ -139,15 +139,26 @@ tab" is a choice Laya can make by itself. It refuses to close the last tab.
 
 ### Choosing the LLM
 
+`qwen3.5` is multimodal at every size, so even the small tags can see:
+
 | Tag | Download | Fits | Notes |
 |---|---|---|---|
-| `qwen3-vl:8b` | 6.1 GB | 12 GB VRAM | the default |
-| `qwen3-vl:4b` | 3.3 GB | 8 GB VRAM | the sweet spot on a laptop |
-| `qwen3-vl:2b` | 1.9 GB | 4 GB VRAM | last resort; expect more `ask_user` |
+| `qwen3.5:9b` | 6.6 GB | 12 GB VRAM | if you have the room |
+| `qwen3.5:4b` | 3.4 GB | 8 GB VRAM | the default |
+| `qwen3.5:2b` | 2.7 GB | 6 GB VRAM | still sees, noticeably dimmer |
+| `qwen3.5:0.8b` | 1.0 GB | 4 GB VRAM | last resort; expect more `ask_user` |
 
 Set `llm.model` to anything Ollama serves, or point `llm.backend: openai` at a
 hosted endpoint. Whatever you pick needs **vision**, or set `llm.vision: false`
 and it runs on the element list alone (worse, but it works).
+
+**Thinking models need `llm.think: off`, which is the default.** Ollama turns
+thinking *on* by default for models that support it, and a thinking model puts
+its answer in `message.thinking` while `content` comes back empty — which looks
+exactly like a broken model. We send `think: false`, fall back to reading
+`thinking` if a model ignores that, and retry without the field on servers that
+reject it. Set `on` if you want the reasoning (slower), `auto` to leave it to
+the server.
 
 One expectation to set: a newer VLM helps less here than the benchmarks imply.
 The model is never asked to *find* anything on screen — it gets a numbered
