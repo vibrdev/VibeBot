@@ -17,10 +17,14 @@ browser:
                            # alone outweighs llm.max_tokens. Does NOT change memory.
 
 decider:
-  backend: off             # off | laya | jev | heuristic. off = the LLM takes every
-                           # step and nothing extra is loaded. Benchmarked, two rounds
-                           # each: off and laya both 7/10, but laya took 144s per goal
-                           # against 57s, and holds ~2 GB. Set laya or jev to compare.
+  backend: match           # match | laya | jev | heuristic | off. The fast decider that
+                           # carries out the plan's steps. match = exact label matching,
+                           # never wrong in testing. laya zero-shot was wrong more often
+                           # than right - see `vibebot bench --executor`.
+  mode: plan               # plan: the LLM plans a few steps, the fast decider carries
+                           # them out one "which element is this?" at a time.
+                           # gate: the original - the fast decider picks every step
+                           # and the LLM steps in when it is unsure.
   model: auto              # auto = Laya's Router; or convaiinnovations/laya[-multilingual]
   device: cpu              # cuda if you have a GPU
   preload: false           # true loads Laya's multilingual weights too (~2.5 GB of

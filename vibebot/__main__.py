@@ -54,6 +54,12 @@ def main(argv: list[str] | None = None) -> int:
         "--llm-only", action="store_true",
         help="never let the fast decider act, to measure what it is worth",
     )
+    bench_cmd.add_argument("--mode", choices=["plan", "gate"], help="override decider.mode")
+    bench_cmd.add_argument(
+        "--executor", nargs="*", metavar="BACKEND",
+        help="exam the fast decider on plan steps instead (default: laya match)",
+    )
+    bench_cmd.add_argument("--decider", help="override decider.backend (laya, jev, heuristic, off)")
 
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -90,6 +96,15 @@ def main(argv: list[str] | None = None) -> int:
             cfg.llm.model = args.model
         if args.llm_only:
             cfg.decider.backend = "off"
+        if args.mode:
+            cfg.decider.mode = args.mode
+        if args.decider:
+            cfg.decider.backend = args.decider
+        cfg._normalize()  # validate the overrides the same way as the file
+        if args.executor is not None:
+            from .execbench import executor_bench
+
+            return executor_bench(cfg, args.executor or ["laya", "match"])
         return bench(
             cfg, repeat=args.repeat, out=args.out, headless=not args.show,
             allow_degraded=args.allow_degraded, suite=args.suite, only=args.only,

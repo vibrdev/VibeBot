@@ -24,6 +24,7 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
 from urllib.parse import unquote, unquote_plus, urlparse, urlsplit, urlunsplit
 
@@ -31,6 +32,7 @@ from .browser import BrowserSession
 from .config import Config
 from .deciders import Verdict, build_decider
 from .llm import build_llm
+from .llm.base import NO_RESULTS
 from .ranking import goal_terms, is_plausible, rank_candidates, text_candidates
 from .schema import GLOBAL_OPS, TERMINAL_OPS, Action, Observation, StepRecord
 from .sysmem import snapshot
@@ -44,6 +46,8 @@ EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 #: call, so they are paid for every step.
 MEMORY_ITEMS = 24
 MEMORY_CHARS = 2400
+#: Longest plan the fast decider is handed at once.
+PLAN_STEPS = 6
 
 
 class Agent:
@@ -101,6 +105,10 @@ class Agent:
         self._pages_checked = False
         #: Whether an answer that admits a missing part has been.
         self._incomplete_checked = False
+        #: The LLM's remaining steps, for the fast decider to carry out
+        #: (decider.mode: plan). Emptied whenever the page stops matching it.
+        self._plan: list[str] = []
+        self._last_typed = ""
 
     # ------------------------------------------------------------- lifecycle
 
@@ -159,6 +167,8 @@ class Agent:
         self._challenged = False
         self._pages_checked = False
         self._incomplete_checked = False
+        self._plan = []
+        self._last_typed = ""
 
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
         trace = Trace(self.cfg.trace_dir, run_id)
@@ -205,6 +215,7 @@ class Agent:
             started = time.perf_counter()
             self._step_llm = []
             self._step_asks = []
+            self._step_options = None
             obs = await self.browser.observe(read_chars=self._read_chars())
             obs.step = step
 
@@ -236,12 +247,14 @@ class Agent:
                 tabs=[{"index": t.index, "url": t.url, "active": t.active} for t in obs.tabs],
             )
 
-            verdict = await self.decider.decide(
-                self.goal, obs, candidates, self._history, text_candidates(self.goal)
-            )
-            await self.emit("verdict", step=step, **verdict.to_json())
-
-            action, escalated = await self._resolve(obs, candidates, verdict, stalls)
+            if self._planning():
+                action, escalated, verdict = await self._plan_step(obs, candidates, stalls, step)
+            else:
+                verdict = await self.decider.decide(
+                    self.goal, obs, candidates, self._history, text_candidates(self.goal)
+                )
+                await self.emit("verdict", step=step, **verdict.to_json())
+                action, escalated = await self._resolve(obs, candidates, verdict, stalls)
 
             if action.op in TERMINAL_OPS - {"fail"}:
                 summary = action.text or "Done."
@@ -253,9 +266,12 @@ class Agent:
 
             before = obs.fingerprint()
             outcome = await self._execute(action, obs)
+            if outcome.startswith("FAILED"):
+                self._plan = []  # the plan assumed this step would work
             if action.source == "laya":
                 self._tried.add((_page_key(obs.url), action.op, action.element_idx))
             self._last_click = _click_signature(action, obs)
+            self._last_typed = action.text if action.op == "type" else ""
             if action.op == "scroll":
                 key = _page_key(obs.url)
                 self._scrolls[key] = self._scrolls.get(key, 0) + 1
@@ -293,6 +309,7 @@ class Agent:
                 # clicking the link for the page you are already on returns
                 # "clicked element 3" forever. Bar it whoever chose it.
                 self._tried.add((_page_key(obs.url), action.op, action.element_idx))
+                self._plan = []  # a step that changes nothing means the plan is off
                 stalls += 1
                 if stalls >= policy.stall_limit * 2:
                     answer = await self.ask_user(
@@ -591,9 +608,16 @@ class Agent:
         self._llm_calls += 1
         await self.emit("thinking", note=note, calls=self._llm_calls)
         obs.memory = list(self._memory)
+        obs.plan = list(self._plan)
         decision = await self.llm.decide(
             self.goal, obs, candidates, self._history, note, obs.annotated_png if self.cfg.llm.vision else None
         )
+        if self._planning():
+            # Whatever the LLM was asked, its answer replaces the old plan: it
+            # has just looked at the page, and the old plan is what got us here.
+            self._plan = [step for step in decision.plan if step][:PLAN_STEPS]
+            if self._plan:
+                await self.emit("plan", steps=list(self._plan))
         found = list(decision.notes)
         # A blank tab has nothing worth remembering, and "the page is blank"
         # was the first line of every run's notes.
@@ -687,6 +711,146 @@ class Agent:
             "words, drop a filter) and look again. If it still does not exist, answer "
             "the same way again.",
         )
+
+    # ------------------------------------------------------ plan and execute
+
+    def _planning(self) -> bool:
+        return self.cfg.decider.mode == "plan" and self.decider.name != "off"
+
+    async def _plan_step(
+        self, obs: Observation, candidates: list, stalls: int, step: int
+    ) -> tuple[Action, str | None, Verdict]:
+        """One step of decider.mode: plan.
+
+        The fast decider carries out the LLM's plan one intent at a time, and
+        the LLM is called when there is no plan left, the page no longer fits
+        it, or the next step is reading and answering. Returns (action, who
+        escalated, the fast decider's verdict for the trace).
+        """
+        llm_verdict = Verdict(target="ask_llm", backend="plan")
+
+        reason = self._replan_reason(obs, stalls)
+        if reason:
+            self._plan = []
+            action, escalated = await self._llm_step(obs, candidates, reason)
+            return action, escalated, llm_verdict
+
+        # qwen3.5:4b often starts its plan with the action it has just taken:
+        # it sorted by price, then planned "click 'Price: lowest first'". Laya
+        # found it (p=0.997), the undo guard refused it, and the step went back
+        # to the LLM. A step that repeats the last action is already done.
+        while self._plan and self._repeats_last_action(self._plan[0]):
+            self._plan.pop(0)
+        if not self._plan:
+            action, escalated = await self._llm_step(
+                obs, candidates, "Choose the next step, and write the plan for the steps after it."
+            )
+            return action, escalated, llm_verdict
+
+        intent = self._plan[0]
+        kind = _intent_kind(intent)
+
+        if kind == "answer":
+            self._plan.pop(0)
+            action, escalated = await self._llm_step(
+                obs, candidates,
+                f"Your plan's next step is: {intent}. Do it now, from this page.",
+            )
+            return action, escalated, llm_verdict
+
+        if kind == "navigate":
+            self._plan.pop(0)
+            url = _URL.search(intent).group(0).rstrip(".,)'\"")
+            return Action(op="navigate", text=url, reason=f"plan: {intent}", source="plan"), None, llm_verdict
+
+        if kind in {"scroll", "back"}:
+            self._plan.pop(0)
+            return (
+                Action(op=kind, text="down" if kind == "scroll" else "", reason=f"plan: {intent}", source="plan"),
+                None,
+                llm_verdict,
+            )
+
+        # An element step: the one question the fast decider is asked.
+        options = rank_candidates(
+            obs.elements, intent, [], limit=self.cfg.decider.max_candidates, url=obs.url
+        )
+        quoted = _quoted(intent)
+        # Page text is irrelevant to "which element is this?", and every 200
+        # characters of it costs Laya about 0.7s (measured).
+        blind = replace(obs, text_digest="")
+        verdict = await self.decider.decide(intent, blind, options, self._history[-4:], quoted)
+        await self.emit("verdict", step=step, **verdict.to_json())
+        # Record what the fast decider was actually shown and asked, so a
+        # wrong pick can be checked against its options afterwards.
+        self._step_options = {"intent": intent, "options": [f"e{el.idx}: {el.label()}" for el in options]}
+
+        # Any element on the page, not just the shortlist: the planner can name
+        # one by its number, and that element need not rank in the top twelve.
+        valid = {f"e{el.idx}": el for el in obs.elements}
+        cfg = self.cfg.decider
+        element = valid.get(verdict.target)
+        if element is None or not verdict.is_confident(cfg.accept_probability, cfg.accept_margin):
+            self._plan = []
+            best = f"{verdict.target} at p={verdict.p_top:.0%}"
+            action, escalated = await self._llm_step(
+                obs, candidates,
+                f"Your plan's next step was \"{intent}\", but the fast helper could not find "
+                f"it on this page (best guess {best}). Look at the page, do the right thing "
+                "now, and give an updated plan.",
+            )
+            return action, escalated, verdict
+
+        op, text = _intent_operation(intent, element, quoted)
+        signature = _click_signature(Action(op=op, element_idx=element.idx), obs)
+        if (_page_key(obs.url), op, element.idx) in self._tried or (
+            signature is not None and signature == self._last_click
+        ):
+            self._plan = []
+            action, escalated = await self._llm_step(
+                obs, candidates,
+                f"Your plan's next step was \"{intent}\", which points at {element.label(60)} - "
+                "but that was just done, and doing it again would undo it or go nowhere. "
+                "Look at the page and decide again.",
+            )
+            return action, escalated, verdict
+
+        self._plan.pop(0)
+        action = Action(
+            op=op,
+            element_idx=element.idx,
+            text=text,
+            reason=f"plan: {intent} (laya p={verdict.p_top:.0%})",
+            source="laya",
+            confidence=verdict.p_top,
+            risky=verdict.risky_p,
+        )
+        return await self._risk_gate(action, obs), None, verdict
+
+    def _repeats_last_action(self, intent: str) -> bool:
+        """Does this plan step name exactly what the last step did?"""
+        quoted = [q.lower() for q in _quoted(intent)]
+        if not quoted:
+            return False
+        if self._last_click is not None and any(q in self._last_click[2] for q in quoted):
+            return True
+        return bool(self._last_typed) and self._last_typed.lower() in quoted
+
+    def _replan_reason(self, obs: Observation, stalls: int) -> str:
+        """Why the plan no longer applies, or "" if it still does."""
+        if self._drifted:
+            note, self._drifted = self._drifted, ""
+            return note
+        if not self._plan:
+            return "Choose the next step, and write the plan for the steps after it."
+        if obs.page_text and NO_RESULTS.search(obs.page_text):
+            return (
+                "This page shows no results, so the plan cannot continue. Change the search "
+                "and give a new plan."
+            )
+        if stalls >= self.cfg.policy.stall_limit:
+            return "The last steps did not change the page. Look again and give a new plan."
+        return ""
 
     def _read_chars(self) -> int:
         """Read the page only when there is an LLM to read it."""
@@ -870,6 +1034,8 @@ class Agent:
             {k: v for k, v in call.items() if k != "prompt"} for call in self._step_llm
         ]
         payload["asked_you"] = list(self._step_asks)
+        if getattr(self, "_step_options", None):
+            payload["fast_decider"] = self._step_options
         trace.write({"type": "step", **payload})
         trace.step_note(payload, self._step_llm)
 
@@ -901,6 +1067,69 @@ def _is_search_typing(element, op: str) -> bool:  # noqa: ANN001
     if element.role == "searchbox" or element.input_type == "search":
         return True
     return "search" in f"{element.name} {element.placeholder}".lower()
+
+
+_URL = re.compile(r"https?://[^\s'\"]+", re.I)
+_ANSWER_STEP = re.compile(
+    r"^\s*(read|answer|report|extract|note|remember|compare|count|tell|summari[sz]e|check|"
+    r"verify|look at|give|wait)\b|\band (answer|read|report)\b",
+    re.I,
+)
+#: A step that says click must not become typing. "click 'Search'" matched to
+#: the search box once typed the word "Search" into it.
+_CLICK_VERB = re.compile(r"^\s*(click|press|tap|open|choose|pick|toggle)\b", re.I)
+_QUOTED = re.compile(r"(?:^|[\s(:])['\"“‘]([^'\"”’]{1,80})['\"”’](?=$|[\s),.:;!?])")
+_TYPE_WITHOUT_QUOTES = re.compile(
+    r"^\s*(?:type|enter|search(?:\s+for)?)\s+(.+?)(?:\s+(?:into|in)\s+(?:the\s+)?\S.*)?$", re.I
+)
+
+
+def _intent_kind(intent: str) -> str:
+    """answer | navigate | scroll | back | element - who can carry this step out.
+
+    Reading and answering is the LLM's job; a URL, a scroll or going back need
+    no model at all; everything else is "which element is this?", which is
+    the fast decider's.
+    """
+    text = intent.strip().lower()
+    if _ANSWER_STEP.search(text):
+        return "answer"
+    if _URL.search(intent) and re.match(r"^\s*(go to|navigate|open|visit|load)\b", text):
+        return "navigate"
+    if re.match(r"^\s*scroll\b", text):
+        return "scroll"
+    if re.match(r"^\s*(go back|back)\b", text):
+        return "back"
+    return "element"
+
+
+def _quoted(intent: str) -> list[str]:
+    """Quoted labels and text in an intent. Tolerates apostrophes in words
+    ("the item's 'Buy'") by only taking quotes that open after a space."""
+    return [match.strip() for match in _QUOTED.findall(intent) if match.strip()]
+
+
+def _intent_operation(intent: str, element, quoted: list[str]) -> tuple[str, str]:  # noqa: ANN001
+    """(op, text) for an intent, decided from the element rather than asked.
+
+    The fast decider only answers which element. Asked for the verb too, Laya
+    paired a link with "select" and Playwright raised - six steps running on
+    a real run - so the verb comes from what the element is.
+    """
+    is_select = element.tag == "select" or element.role == "listbox"
+    if is_select:
+        return "select", quoted[0] if quoted else ""
+    is_field = (element.tag in {"input", "textarea"} or element.role in {"searchbox", "textbox", "combobox"}) \
+        and element.input_type not in {"checkbox", "radio", "submit", "button", "image", "reset"}
+    if is_field and not _CLICK_VERB.match(intent):
+        label = (element.text or element.name or element.placeholder or "").strip().lower()
+        typed = [q for q in quoted if q.lower() != label]
+        if typed:
+            return "type", typed[0]
+        match = _TYPE_WITHOUT_QUOTES.match(intent)
+        if match:
+            return "type", match.group(1).strip(" '\"")
+    return "click", ""
 
 
 _NOTHING = re.compile(

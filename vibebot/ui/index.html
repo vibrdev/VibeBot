@@ -278,6 +278,7 @@ function handle(e) {
     case 'error': add('bad', e.message); break;
     case 'log': add('user', e.message); break;
     case 'notes': showFound(e.notes || [], e.added || []); break;
+    case 'plan': add('llm', 'plan for the fast decider', (e.steps || []).join('  →  ')); break;
     case 'run_end':
       add(e.status === 'done' ? 'user' : 'bad', 'FINISHED: ' + e.status, e.summary);
       endRun(e.status, e.summary);
