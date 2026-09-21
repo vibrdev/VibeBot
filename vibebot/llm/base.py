@@ -36,9 +36,7 @@ Reply with ONE JSON object and nothing else:
   "op": "click|type|select|scroll|navigate|back|wait|extract|switch_tab|close_tab|ask_user|done|fail",
   "element_idx": <a [number] from PAGE, or null>,
   "text": "<text to type / option to select / url / tab number / question / final answer>",
-  "notes": ["<any other fact worth keeping for later>"],
-  "reason": "<one short sentence>",
-  "confidence": <0.0-1.0>
+  "notes": ["<any other fact worth keeping for later>"]
 }
 
 Always fill in "seen" first - look before you act. It is saved to NOTES for you.
@@ -114,6 +112,11 @@ class LLMAction:
     Jev does it, one narrow "which element is this?" question at a time."""
     seen: str = ""
     """What the model says this page shows, written before it picks an action.
+
+    It is also what explains an action now. The format used to end with
+    "reason" and "confidence"; measured over a benchmark run they were 24% of
+    every reply, and coming after the action they could not influence it. At
+    ~10 tokens/s on this hardware that was about 3 seconds per call, wasted.
 
     Optional notes did not work with qwen3.5:4b: over two benchmark rounds it
     saved two notes in 67 steps. Small models reliably fill in whatever comes

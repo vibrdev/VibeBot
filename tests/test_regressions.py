@@ -754,3 +754,17 @@ def test_an_unknown_decider_is_an_error_not_a_quiet_default():
     _merge(cfg, yaml.safe_load("decider:\n  backend: lyaa\n"))
     with pytest.raises(ValueError, match="decider.backend"):
         cfg._normalize()
+
+
+def test_the_count_goal_does_not_pass_on_a_page_number():
+    """"There is 1 listing ... this is page 3 of 3 ... the total count is 1"
+    passed, because the 3 of "page 3" matched."""
+    from vibebot.bench import SHOP_SUITE
+
+    count = next(t for t in SHOP_SUITE if t.name == "shop-count-128")
+    assert not count.passed("There is 1 MacBook listing ... Since this is page 3 of 3, the total count is 1.")
+    for good in ("3", "There are 3 MacBook listings in Used condition with exactly 128GB of memory.",
+                 "There are 3 Used MacBook listings with exactly 128GB of memory.", "The count is 3."):
+        assert count.passed(good), good
+    for bad in ("2", "1", "0 results"):
+        assert not count.passed(bad), bad

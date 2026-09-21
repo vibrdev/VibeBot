@@ -197,6 +197,31 @@ on the box. Run out and Ollama answers `500` on every step, which VibeBot now
 reports with Ollama's own words ("out of memory") instead of a bare status code.
 Close other apps, set `llm.vision: false`, or drop a size.
 
+**Measured on a 4 GB laptop GPU (RTX 3050 Ti, 16 GB RAM)**, where every model
+below spills from the card into system RAM and generation speed is the
+bottleneck:
+
+| model | generation | one call | test shop, 2 rounds | total |
+|---|---|---|---|---|
+| `qwen3.5:4b`, thinking off | 9.7 tok/s | ~26 s | **8/10** | **~800 s** |
+| `qwen3.5:9b`, thinking off | 4.5 tok/s | ~32 s | 7/10 | 2,648 s |
+| `qwen3.5:4b`, thinking on | 9.1 tok/s | ~77 s, some over 10 min | stopped | - |
+| Ternary Bonsai 2 27B (PrismML fork, CUDA 12.4) | 0.13 tok/s | ~30 min | not viable | - |
+
+- **The 9B** is not smarter enough here to pay for being 3.4x slower.
+- **Thinking** triples the average call and, worse, some calls run away: one
+  thought for over ten minutes and hit the timeout without answering. Ollama
+  cannot cap thinking separately, and capping the whole reply cuts the answer.
+- **Bonsai 2 27B** (Apache 2.0, 5.95 GB, needs PrismML's llama.cpp fork -
+  stock Ollama rejects the file) generated 0.13 tokens/second, split across GPU
+  and CPU and CPU-only alike, with the model fully resident (not paging).
+  PrismML's own guidance is to put the whole model on the GPU and to use a
+  smaller model below 4 GB of VRAM. It may be excellent on a bigger card.
+
+What helped instead was writing less: `reason` and `confidence` were 24% of
+every reply, came after the action so could not influence it, and cost ~3 s a
+call at these speeds. They are gone; `seen` explains the action.
+
 Set `llm.model` to anything Ollama serves, or point `llm.backend: openai` at a
 hosted endpoint. Whatever you pick needs **vision**, or set `llm.vision: false`
 and it runs on the element list alone (worse, but it works).

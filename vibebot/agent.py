@@ -633,7 +633,7 @@ class Agent:
                 "op": decision.op,
                 "element_idx": decision.element_idx,
                 "text": decision.text[:300],
-                "reason": decision.reason,
+                "reason": decision.reason or decision.seen,
                 "confidence": decision.confidence,
                 "raw": decision.raw,
                 "prompt": decision.prompt,
@@ -647,7 +647,7 @@ class Agent:
             op=decision.op,
             element_idx=decision.element_idx,
             text=decision.text[:200],
-            reason=decision.reason,
+            reason=decision.reason or decision.seen,
             confidence=decision.confidence,
         )
         return decision
@@ -1291,7 +1291,7 @@ def _from_llm(decision) -> Action:  # noqa: ANN001
         op=decision.op,
         element_idx=decision.element_idx,
         text=decision.text,
-        reason=decision.reason or "llm",
+        reason=decision.reason or decision.seen[:160] or "llm",
         source="llm",
         confidence=decision.confidence,
     )
