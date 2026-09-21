@@ -109,6 +109,14 @@
     background: transparent; color: var(--muted); border: 1px solid var(--line);
   }
   #foot b { color: var(--text); font-weight: 600; }
+  #found {
+    display: none; margin: 0 0 10px; padding: 10px 14px; border-radius: 10px;
+    border: 1px solid var(--line); background: #0b0d10; max-height: 30vh; overflow: auto;
+  }
+  #found.show { display: block; }
+  #found .r-head { font: 600 11px/1 inherit; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  #found ul { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.45; }
+  #found li.new { color: #9be7c4; }
   footer { padding: 8px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); } }
   @media (max-width: 760px) {
@@ -158,6 +166,10 @@
       <div class="r-head"><span id="r-status">finished</span><button id="r-copy">copy</button></div>
       <div class="r-answer" id="r-answer"></div>
     </div>
+    <div id="found">
+      <div class="r-head">found so far</div>
+      <ul id="found-list"></ul>
+    </div>
     <div id="feed"></div>
     <div id="ask">
       <p id="question"></p>
@@ -201,12 +213,18 @@ function showShutdown() {
 
 function connect() {
   socket = new WebSocket(wsUrl);
-  socket.onopen = () => { retry = 0; $('p-conn').textContent = 'connected'; };
+  socket.onopen = () => { retry = 0; $('p-conn').textContent = 'connected'; reconcile(); };
   socket.onclose = () => {
     // After a Quit the server is gone on purpose; reconnecting would just
     // hammer a dead port and hide the notice.
     if (quitting) { showShutdown(); return; }
     $('p-conn').textContent = 'disconnected';
+    // The clock only stops on "run finished", which a dead connection never
+    // delivers - a page left open once read "125m 46s · 0 llm calls".
+    if (runStarted) {
+      clearInterval(ticker); ticker = null;
+      $('foot').innerHTML = '<b>lost connection</b> to VibeBot - reconnecting…';
+    }
     setTimeout(connect, Math.min(5000, 400 * ++retry));
   };
   socket.onmessage = (ev) => {
@@ -257,6 +275,7 @@ function handle(e) {
     case 'paused': $('foot').textContent = e.value ? 'paused' : 'running…'; break;
     case 'error': add('bad', e.message); break;
     case 'log': add('user', e.message); break;
+    case 'notes': showFound(e.notes || [], e.added || []); break;
     case 'run_end':
       add(e.status === 'done' ? 'user' : 'bad', 'FINISHED: ' + e.status, e.summary);
       endRun(e.status, e.summary);
@@ -285,7 +304,38 @@ function setRunning(on) {
   $('stop').disabled = !on;
 }
 
+function showFound(notes, added) {
+  const list = $('found-list');
+  list.innerHTML = '';
+  const fresh = new Set(added);
+  for (const note of notes) {
+    const li = document.createElement('li');
+    li.textContent = note;
+    if (fresh.has(note)) li.className = 'new';
+    list.appendChild(li);
+  }
+  $('found').className = notes.length ? 'show' : '';
+}
+
+// After a reconnect, ask whether the goal this page thinks is running still
+// is. If VibeBot was restarted, or the goal ended while we were away, say so
+// instead of carrying on counting.
+async function reconcile() {
+  if (!runStarted) return;
+  try {
+    const status = await (await fetch('/api/status')).json();
+    if (status.running) {
+      if (!ticker) ticker = setInterval(footer, 1000);
+      footer();
+    } else {
+      endRun('stopped', 'Lost track of this goal: the connection dropped or VibeBot was restarted, '
+        + 'and it is no longer running. Its log is in .vibebot/traces.');
+    }
+  } catch (err) { /* still unreachable; the next reconnect tries again */ }
+}
+
 function beginRun() {
+  showFound([], []);
   runStarted = Date.now(); llmCalls = 0; lastStep = 0;
   $('result').className = '';
   clearInterval(ticker);

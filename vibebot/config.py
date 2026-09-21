@@ -46,7 +46,21 @@ class BrowserConfig:
 
 @dataclass
 class DeciderConfig:
-    backend: str = "laya"
+    backend: str = "off"
+    """off | laya | jev | heuristic. "off" means the LLM takes every step.
+
+    That is the default because of this, two rounds of the benchmark shop each,
+    same code, only this setting different:
+
+                      passed   median per goal   total    LLM calls
+        laya          7/10     144s              1469s    41
+        off           7/10      57s               922s    47
+
+    Once the agent could read pages and stopped Laya undoing its own filters,
+    Laya no longer cost accuracy - but it did not buy speed either. It saved six
+    LLM calls in ten goals and added steps, because a confident wrong click
+    has to be walked back. It also holds ~2 GB and takes ~35s to warm up.
+    `laya` and `jev` still plug in exactly as before."""
     """laya | jev | heuristic"""
     model: str = "auto"
     """auto (Laya Router), or an explicit repo id such as convaiinnovations/laya."""
@@ -113,6 +127,17 @@ class DeciderConfig:
     jev_api_key_env: str = "JEV_API_KEY"
 
 
+#: Every accepted `decider.backend` value -> the decider it selects. As with
+#: the LLM table below, anything else is a startup error, never a quiet default.
+DECIDER_BACKENDS: dict[str, str] = {
+    "off": "off",
+    "none": "off",
+    "llm": "off",
+    "laya": "laya",
+    "jev": "jev",
+    "heuristic": "heuristic",
+}
+
 #: Every accepted `llm.backend` value -> the implementation it selects.
 #: Spelled out on purpose: an unknown name is a configuration error, not a
 #: reason to quietly pick something. `vibebot.llm.build_llm` routes on this.
@@ -160,6 +185,30 @@ class LLMConfig:
     temperature: float = 0.1
     timeout_s: float = 180.0
     max_tokens: int = 1024
+    page_chars: int = 6000
+    """How much of the page the LLM reads, in characters, per step.
+
+    It used to be the first 1,200 characters of the page's raw text, which on
+    a shop is the header, the sign-in link and a promo banner. It is now the
+    page in reading order with the menus moved to the end (browser._READ_JS),
+    and this is its budget. A results page on the benchmark shop is about
+    1,900 characters; real listing pages run to tens of thousands, where this
+    is what decides how far down the model can see."""
+    num_ctx: int = 8192
+    """Ollama's context window, in tokens. Ignored by the openai backend.
+
+    Ollama's own default is 4096, and that is now too small: measured, the
+    system prompt plus 6,000 characters of page is 3,620 tokens before the
+    ~660-token screenshot and the reply, so 4096 would silently cut the prompt.
+    Measured on qwen3.5:4b, cost of the window on this machine:
+
+        4096   model 3,555 MB   commit +5,621 MB
+        8192   model 3,702 MB   commit +5,818 MB   (+197 MB)
+       16384   model 3,997 MB   commit +6,083 MB   (+462 MB)
+
+    Cheap, because the model's hybrid attention keeps the KV cache small.
+    Latency barely moves (9.5s / 11.9s / 11.1s per call). Raise it with
+    page_chars; do not change it mid-run, which forces an 8.3s reload."""
     keep_alive: str = "5m"
     """How long Ollama keeps the model resident between calls.
 
@@ -251,9 +300,25 @@ class Config:
         Also rejects an unroutable `llm.backend` here rather than at the first
         escalation, so a typo is a startup error instead of a silent reroute."""
         self.llm.think = _tristate(self.llm.think)
+        # Same YAML rule, and it bit: `decider.backend: off` arrived as False,
+        # the decider factory read `False or "laya"`, and a benchmark labelled
+        # "off" was quietly run with Laya deciding 55% of its steps.
+        # `llm.backend: off` would likewise have become "ollama".
+        if self.decider.backend is False:
+            self.decider.backend = "off"
+        if self.llm.backend is False:
+            self.llm.backend = "off"
         self._validate_backends()
 
     def _validate_backends(self) -> None:
+        decider = str(self.decider.backend).strip().lower() if self.decider.backend else ""
+        if decider not in DECIDER_BACKENDS:
+            valid = ", ".join(sorted(DECIDER_BACKENDS))
+            raise ValueError(
+                f"decider.backend: unknown value {self.decider.backend!r}. Valid values: {valid}"
+            )
+        self.decider.backend = DECIDER_BACKENDS[decider]
+
         name = str(self.llm.backend or "ollama").strip().lower()
         if name not in LLM_BACKENDS:
             valid = ", ".join(sorted(set(LLM_BACKENDS)))

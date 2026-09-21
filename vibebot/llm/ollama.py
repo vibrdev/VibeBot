@@ -85,7 +85,11 @@ class OllamaLLM:
             "messages": [{"role": "system", "content": SYSTEM_PROMPT}, message],
             "stream": False,
             "format": "json",
-            "options": {"temperature": self.cfg.temperature, "num_predict": self.cfg.max_tokens},
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_predict": self.cfg.max_tokens,
+                "num_ctx": self.cfg.num_ctx,
+            },
         }
         try:
             content, done_reason = await self._chat(payload)
@@ -106,7 +110,9 @@ class OllamaLLM:
             "model": self.cfg.model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "options": {"temperature": self.cfg.temperature},
+            # Same num_ctx as decide(): a different value makes Ollama reload
+            # the whole model between the two kinds of call.
+            "options": {"temperature": self.cfg.temperature, "num_ctx": self.cfg.num_ctx},
         }
         try:
             content, _ = await self._chat(payload)

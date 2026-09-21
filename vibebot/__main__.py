@@ -45,6 +45,15 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-degraded", action="store_true",
         help="run even if Laya could not load (measures the heuristic fallback)",
     )
+    bench_cmd.add_argument(
+        "--suite", choices=["shop", "web"], default="shop",
+        help="shop = local deterministic test site (default); web = real websites",
+    )
+    bench_cmd.add_argument("--only", nargs="+", help="run only goals whose name contains these")
+    bench_cmd.add_argument(
+        "--llm-only", action="store_true",
+        help="never let the fast decider act, to measure what it is worth",
+    )
 
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -79,9 +88,11 @@ def main(argv: list[str] | None = None) -> int:
             cfg.decider.page_text_chars = args.page_text_chars
         if args.model:
             cfg.llm.model = args.model
+        if args.llm_only:
+            cfg.decider.backend = "off"
         return bench(
             cfg, repeat=args.repeat, out=args.out, headless=not args.show,
-            allow_degraded=args.allow_degraded,
+            allow_degraded=args.allow_degraded, suite=args.suite, only=args.only,
         )
 
     if args.host:

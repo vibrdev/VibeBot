@@ -3,19 +3,21 @@
 A browser agent you run yourself. You give it a goal in your browser, it goes and
 does it — clicking, typing, navigating — and asks you when it gets stuck.
 
-Three layers, cheapest first:
+How it works:
 
-| Layer | What it is | When it decides | Cost |
-|---|---|---|---|
-| **Laya** | 421M non-autoregressive decision model, Apache 2.0 | every step, first | free, local, ~0.3–2s CPU |
-| **LLM** | any local vision model via Ollama | when Laya defers or hesitates | free, local, seconds |
-| **You** | the human | risky actions, dead ends, missing info | a click |
+| Part | What it is | What it does |
+|---|---|---|
+| **Reader** | the page in reading order, every element numbered inline | what the LLM sees - content first, menus last, active filters marked |
+| **LLM** | any local vision model via Ollama (`qwen3.5:4b` by default) | reads the page, decides each step, keeps notes of what it has found |
+| **Checks** | plain code | catches loops, undone filters, "nothing found" after a bad search, a count from page 1 of 3 |
+| **You** | the human | asked before anything that buys, sends, signs in or consents |
 
-Laya is not an LLM — it generates nothing. You hand it a state and typed
-questions, and it returns a probability distribution in one forward pass. So we
-ask it *"which of these 12 elements, or should the LLM take this one?"* and read
-the answer's shape: a clear winner gets clicked immediately; a close race wakes
-the LLM. That is the whole trick.
+A fast pre-decider can sit in front of the LLM and take the obvious clicks:
+**Laya** (a 421M non-autoregressive model, local) or **Jev** (hosted). It is off
+by default, because measured on the test shop it did not pay for itself - same
+accuracy, about 2.5x slower per goal, because its confident wrong clicks had to
+be walked back. `decider.backend: laya` or `jev` turns it on; see
+"Measuring it" for the numbers.
 
 Default install is 100% free and offline. Hosted decision engines (Jev) and
 hosted LLMs are supported but off by default.
@@ -62,7 +64,7 @@ py -3 -m venv .venv          # or py -3.13 / py -3.12 to pin one
 pip install -r requirements.txt
 playwright install chromium
 
-pip install laya                 # the decision model (pulls torch, ~2.5 GB)
+pip install laya                 # optional: only for decider.backend: laya (pulls torch, ~2.5 GB)
 # CPU-only torch is much smaller, if you don't have an NVIDIA card:
 # pip install torch --index-url https://download.pytorch.org/whl/cpu
 
@@ -319,6 +321,44 @@ The rows are also labelled training data — every step where Laya deferred and
 the LLM picked correctly is a fine-tuning example for making Laya handle *your*
 sites without the LLM.
 
+## What the models actually see
+
+This is the part that decides whether a browser agent is any good, so it is
+worth being precise about.
+
+| | Laya | the LLM |
+|---|---|---|
+| page | title, URL, first `page_text_chars` (200) of raw text | the page in reading order, up to `llm.page_chars` (6,000) |
+| elements | the top 12 after ranking | every one, numbered inline where it sits on the page |
+| state | none | what is selected, a loud note when a page shows no results |
+| memory | last 4 actions | everything it has written in `seen` and `notes`, on every step |
+| context | 512-1,024 tokens (built into Laya) | `llm.num_ctx` (8,192) |
+
+Until this version the LLM got twelve elements and the first 1,200 characters
+of the page. On a shop, the first 1,200 characters are the header, "Sign in"
+and a promo banner - the listings and prices were never in front of it.
+
+The reader (`browser._READ_JS`) walks the page in document order, keeps the
+content first and moves header, navigation and footer to the end, and writes
+each element as `[number] label` on its own line, with `(selected)` on active
+filters and sorts. On the test shop's results page that is all ten listings
+with spec, condition and price, sorting and pagination, in about 1,900
+characters.
+
+Memory: every reply now starts with a `seen` field - what on this page matters
+for the goal - which the agent stores and hands back on every later step.
+Optional notes did not work with `qwen3.5:4b` (two saved in 67 steps); a
+mandatory first field did (32 of 32 replies).
+
+Before accepting an answer the agent checks it once against three failures
+the benchmark kept producing:
+
+- "nothing matches", after a search that was simply too narrow;
+- a count or "cheapest" given from page 1 of 3;
+- an answer that says the part asked for is "not specified".
+
+Each gets one push to look again. A genuine answer survives being asked twice.
+
 ## Measuring it
 
 Every change to the agent used to be argued from one run, which is how a fix
@@ -326,21 +366,32 @@ that helps one goal and quietly breaks two others gets shipped. So there is a
 benchmark:
 
 ```
-python -m vibebot bench                       # the default suite, once
-python -m vibebot bench --repeat 3            # three rounds, for variance
-python -m vibebot bench --page-text-chars 200 --out after.json
-python -m vibebot bench --model qwen3.5:9b
+python -m vibebot bench                     # the test shop, once
+python -m vibebot bench --repeat 2          # two rounds - one is too noisy to trust
+python -m vibebot bench --llm-only          # the same, with no fast decider
+python -m vibebot bench --suite web         # real websites, as a smoke test
+python -m vibebot bench --only seller --show
+python -m vibebot bench --model qwen3.5:9b --out after.json
 ```
 
-It runs a fixed set of short goals with one checkable answer each, headless,
-and reports whether each answer matched, how many steps and seconds it took,
-how many steps Laya decided on its own, and how many LLM calls it cost.
+**The default suite is a local test shop** (`vibebot/benchsite`), not the
+internet. Real sites made the numbers meaningless: eBay served bot checks to a
+headless browser, listings changed between runs, and a model can recite 1889
+for the Eiffel Tower without reading a word. The shop never changes and every
+goal has exactly one right answer, derived from its catalogue. It contains the
+traps real runs fell into: the right listing on page 3 of 3 under the default
+sort, cheaper New / For-parts / Refurbished listings, a "1TB" of storage next
+to 32GB of memory, site furniture on every page, and a wiki answer (about a
+fictional tower) 4,000 characters down the page.
 
-It will **refuse to run** if Laya could not load and the heuristic fallback
-stood in. That is not paranoia: one early benchmark ran entirely on the
-fallback, because memory from a previous run had not been released, and its
+It reports whether each answer matched, steps, seconds, how many steps Laya
+decided itself, and LLM calls. It **refuses to run** if Laya could not load and
+the heuristic fallback stood in - one early benchmark did exactly that and its
 numbers looked perfectly healthy. `--allow-degraded` measures the fallback on
 purpose.
+
+Single rounds swing by one or two goals out of five. Compare with `--repeat 2`
+or more.
 
 ## Memory
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -38,6 +39,11 @@ from .trace import Trace
 log = logging.getLogger(__name__)
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
+
+#: Bounds on the notes the LLM carries between pages. They are resent on every
+#: call, so they are paid for every step.
+MEMORY_ITEMS = 24
+MEMORY_CHARS = 2400
 
 
 class Agent:
@@ -84,6 +90,17 @@ class Agent:
         #: url -> consecutive scrolls, so a scroll that is going nowhere can
         #: be named as such in the next prompt.
         self._scrolls: dict[str, int] = {}
+        #: What the LLM chose to remember this run - see _remember.
+        self._memory: list[str] = []
+        #: (path, op, label) of the last click, whoever made it - see
+        #: _click_signature.
+        self._last_click: tuple[str, str, str] | None = None
+        #: Whether a "nothing matches" answer has already been challenged.
+        self._challenged = False
+        #: Whether an answer given with more result pages unseen has been.
+        self._pages_checked = False
+        #: Whether an answer that admits a missing part has been.
+        self._incomplete_checked = False
 
     # ------------------------------------------------------------- lifecycle
 
@@ -137,6 +154,11 @@ class Agent:
         self._just_navigated = False
         self._not_done = set()
         self._scrolls = {}
+        self._memory = []
+        self._last_click = None
+        self._challenged = False
+        self._pages_checked = False
+        self._incomplete_checked = False
 
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
         trace = Trace(self.cfg.trace_dir, run_id)
@@ -183,7 +205,7 @@ class Agent:
             started = time.perf_counter()
             self._step_llm = []
             self._step_asks = []
-            obs = await self.browser.observe()
+            obs = await self.browser.observe(read_chars=self._read_chars())
             obs.step = step
 
             blocked = self._domain_violation(obs.url)
@@ -233,6 +255,7 @@ class Agent:
             outcome = await self._execute(action, obs)
             if action.source == "laya":
                 self._tried.add((_page_key(obs.url), action.op, action.element_idx))
+            self._last_click = _click_signature(action, obs)
             if action.op == "scroll":
                 key = _page_key(obs.url)
                 self._scrolls[key] = self._scrolls.get(key, 0) + 1
@@ -283,7 +306,13 @@ class Agent:
             else:
                 stalls = 0
 
-        return "max_steps", f"Hit the {policy.max_steps}-step limit. Last page: {(await self.browser.observe(screenshot=False)).url}"
+        last = (await self.browser.observe(screenshot=False)).url
+        if self._memory:
+            # Running out of steps is not the same as having found nothing.
+            # Hand back what the run did learn rather than just where it ended.
+            found = "; ".join(self._memory[-8:])
+            return "max_steps", f"Ran out of steps ({policy.max_steps}) before finishing. What I found so far: {found}"
+        return "max_steps", f"Hit the {policy.max_steps}-step limit. Last page: {last}"
 
     # -------------------------------------------------------------- decisions
 
@@ -329,6 +358,7 @@ class Agent:
                 "explain what is missing - reply with the next action (click, type, "
                 "navigate or scroll) that gets to it.",
             )
+            confirmed = await self._second_look(confirmed, obs, candidates)
             if confirmed.op in TERMINAL_OPS - {"fail"}:
                 return _from_llm(confirmed), "llm"
             self._not_done.add(_page_key(obs.url))
@@ -354,6 +384,21 @@ class Agent:
             op, needs_llm = _coerce_operation(verdict.operation, element, verdict.text)
             if needs_llm:
                 return await self._llm_step(obs, candidates, needs_llm)
+            if self._last_click and self._last_click == _click_signature(
+                Action(op=op, element_idx=element.idx), obs
+            ):
+                # Laya cannot see which filters are on. On the benchmark shop it
+                # clicked "Refurbished", landed on the filtered list, and
+                # clicked "Refurbished" again - which turned it off - six times
+                # in one run, undoing the LLM's sort and filter each time. The
+                # URL differs each time, so the per-page guard never saw it.
+                return await self._llm_step(
+                    obs,
+                    candidates,
+                    f"Laya wants to {op} {element.label(60)} again, straight after the last "
+                    "step did exactly that. On most sites that undoes it (filters toggle). "
+                    "Decide whether it is really needed.",
+                )
             if (_page_key(obs.url), op, element.idx) in self._tried:
                 return await self._llm_step(
                     obs,
@@ -429,7 +474,11 @@ class Agent:
 
         # 4. Everything else is the LLM's problem.
         if verdict.wants_llm:
-            note = "Laya deferred this step to you."
+            note = (
+                "Choose the next step."
+                if verdict.backend == "off"
+                else "Laya deferred this step to you."
+            )
         elif verdict.target == "done" and _page_key(obs.url) in self._not_done:
             # Reporting p=98% as "below the acceptance gate" was simply false:
             # the gate never looked at it, because this page had already been
@@ -483,6 +532,7 @@ class Agent:
         self, decision, obs: Observation, candidates: list, retry: bool = True  # noqa: ANN001
     ) -> tuple[Action, str]:
         """Turn one LLM reply into the step's action."""
+        decision = await self._second_look(decision, obs, candidates)
         if decision.op == "ask_user":
             question = decision.text or "I am not sure how to continue. What should I do?"
             answer = await self.ask_user(question)
@@ -492,11 +542,33 @@ class Agent:
         action = _from_llm(decision)
         if action.op not in GLOBAL_OPS and action.element_idx is None:
             return Action(op="scroll", text="down", reason="llm gave no target", source="policy"), "llm"
+        corrected = _named_target(action, obs.elements)
+        if corrected is not None:
+            log.info("llm named %r but picked [%s]; using [%s]", action.text, action.element_idx, corrected)
+            action.element_idx = corrected
         element = next((el for el in obs.elements if el.idx == action.element_idx), None)
         if element is not None:
             action.op, _ = _coerce_operation(
                 action.op, element, action.text, text_is_deliberate=True
             )
+        if (
+            retry
+            and element is not None
+            and self._last_click is not None
+            and _click_signature(action, obs) == self._last_click
+        ):
+            # The toggle guard used to bind only Laya. With Laya off, the LLM
+            # clicked "Used" on and off eleven times in one run, sure each time
+            # it was "clearing the filter to broaden the search".
+            again = await self._escalate(
+                obs,
+                candidates,
+                f"You clicked {element.label(60)} on the previous step as well. Clicking it "
+                "again undoes that (filters turn on and off). If the page shows no results, "
+                "the search words are the problem, not this filter: change the search. "
+                "Otherwise choose a different action.",
+            )
+            return await self._use_llm_decision(again, obs, candidates, retry=False)
         if (
             retry
             and element is not None
@@ -518,9 +590,17 @@ class Agent:
     async def _escalate(self, obs: Observation, candidates: list, note: str):
         self._llm_calls += 1
         await self.emit("thinking", note=note, calls=self._llm_calls)
+        obs.memory = list(self._memory)
         decision = await self.llm.decide(
             self.goal, obs, candidates, self._history, note, obs.annotated_png if self.cfg.llm.vision else None
         )
+        found = list(decision.notes)
+        if decision.seen:
+            where = (obs.title or urlsplit(obs.url).path or obs.url)[:50]
+            found.insert(0, f"[{where}] {decision.seen}")
+        added = self._remember(found)
+        if added:
+            await self.emit("notes", added=added, notes=list(self._memory))
         self._step_llm.append(
             {
                 "note": note,
@@ -532,6 +612,8 @@ class Agent:
                 "raw": decision.raw,
                 "prompt": decision.prompt,
                 "vision": bool(self.cfg.llm.vision and obs.annotated_png),
+                "notes": list(decision.notes),
+                "seen": decision.seen,
             }
         )
         await self.emit(
@@ -543,6 +625,88 @@ class Agent:
             confidence=decision.confidence,
         )
         return decision
+
+    async def _second_look(self, decision, obs: Observation, candidates: list):  # noqa: ANN001
+        """Challenge the first "there is nothing" once before believing it.
+
+        Searched "refurbished MacBook M3 Max cheapest" on the benchmark shop -
+        no listing title contains "cheapest", so zero results - the model
+        concluded "No listings match for refurbished MacBook M3 Max" and the
+        run ended on an answer that was simply wrong. The prompt already says
+        to loosen a search that finds nothing; a 4B model does not reliably do
+        it unprompted. One challenge per run: a genuine "none exists" survives
+        being asked twice.
+        """
+        if (
+            not self._pages_checked
+            and decision.op in {"done", "extract"}
+            and _COMPARING.search(self.goal or "")
+            and _more_pages(obs)
+        ):
+            # Asked how many used 128GB listings there were, it dropped the
+            # memory filter, counted the ones on page 1 of 3 and answered 2.
+            # The answer was 3.
+            self._pages_checked = True
+            return await self._escalate(
+                obs,
+                candidates,
+                f"You are about to answer ({decision.text[:80]!r}), but this page says there "
+                "are more pages of results. For a count or a cheapest/most/all question, an "
+                "answer from one page is only right if the list is sorted by exactly what "
+                "you compare, or filtered down to exactly what the goal asks. If it is not, "
+                "go through the other pages (or sort/filter) first. If it is, answer again.",
+            )
+        if (
+            not self._incomplete_checked
+            and decision.op in {"done", "extract"}
+            and _INCOMPLETE.search(decision.text or "")
+        ):
+            # It found the right listing in three steps and answered "16,400
+            # SEK ... (seller not specified in visible text)" - twice, in two
+            # rounds. The seller was one click away on the item's own page.
+            self._incomplete_checked = True
+            return await self._escalate(
+                obs,
+                candidates,
+                "Your answer says part of what the goal asks for is not shown here. Do not "
+                "finish without it: open the item or page that has it (on most sites the "
+                "details - seller, full specs, shipping - are on the item's own page, "
+                "through its link). Answer once you can see it.",
+            )
+        if self._challenged or not _sounds_like_nothing(decision):
+            return decision
+        self._challenged = True
+        return await self._escalate(
+            obs,
+            candidates,
+            "You are about to report that nothing matches. Before concluding that, "
+            "check it: a search with too many words, or one filter too many, often "
+            "finds nothing when the thing exists. Loosen the search (two or three key "
+            "words, drop a filter) and look again. If it still does not exist, answer "
+            "the same way again.",
+        )
+
+    def _read_chars(self) -> int:
+        """Read the page only when there is an LLM to read it."""
+        return 0 if self.llm.name == "none" else max(0, self.cfg.llm.page_chars)
+
+    def _remember(self, notes: list[str]) -> list[str]:
+        """Add the model's new notes to the run's memory; return what was new.
+
+        Bounded, oldest out first: the notes are resent every step, and a 4B
+        model's context is not the place for an unbounded diary.
+        """
+        seen = {" ".join(n.lower().split()) for n in self._memory}
+        added = []
+        for note in notes:
+            key = " ".join(note.lower().split())
+            if key and key not in seen:
+                seen.add(key)
+                self._memory.append(note)
+                added.append(note)
+        while len(self._memory) > MEMORY_ITEMS or sum(map(len, self._memory)) > MEMORY_CHARS:
+            self._memory.pop(0)
+        return added
 
     async def _risk_gate(self, action: Action, obs: Observation) -> Action:
         """Ask before anything that spends money, sends, deletes or logs in."""
@@ -735,6 +899,81 @@ def _is_search_typing(element, op: str) -> bool:  # noqa: ANN001
     if element.role == "searchbox" or element.input_type == "search":
         return True
     return "search" in f"{element.name} {element.placeholder}".lower()
+
+
+_NOTHING = re.compile(
+    r"\b(no|none|nothing|not|couldn'?t|could not|unable|doesn'?t|does not|zero|0)\b"
+    r"[^.]{0,60}?\b(match|matches|matching|found|find|exist|exists|available|listings?|results?|items?)\b",
+    re.I,
+)
+
+
+#: Goals whose answer depends on having seen every candidate.
+_COMPARING = re.compile(
+    r"\b(cheapest|lowest|highest|most|least|fewest|how many|count|number of|all|every|"
+    r"best|largest|smallest|biggest|newest|oldest|compare)\b",
+    re.I,
+)
+_PAGE_OF = re.compile(r"\bpage\s+(\d+)\s+of\s+(\d+)\b", re.I)
+#: An answer that admits it does not contain what was asked.
+_INCOMPLETE = re.compile(
+    r"\bnot (?:specified|shown|visible|listed|mentioned|provided|displayed|stated|given)\b"
+    r"|\b(?:unknown|unclear)\b|\bcan(?:no|')t (?:see|tell|find)\b",
+    re.I,
+)
+_NEXT = re.compile(r"^(next|next page|next ›|›|»|load more|show more|more results)$", re.I)
+
+
+def _more_pages(obs: Observation) -> bool:
+    """Does this page say there is more of the list somewhere else?"""
+    for match in _PAGE_OF.finditer(obs.page_text or ""):
+        if int(match.group(1)) < int(match.group(2)):
+            return True
+    return any(_NEXT.match((el.text or el.name or "").strip()) for el in obs.elements)
+
+
+def _sounds_like_nothing(decision) -> bool:  # noqa: ANN001
+    """A give-up, or a finished answer that says nothing was found."""
+    if decision.op == "fail":
+        return True
+    return decision.op in {"done", "extract"} and bool(_NOTHING.search(decision.text or ""))
+
+
+def _named_target(action: Action, elements: list) -> int | None:
+    """The element the LLM named, when that is not the one it numbered.
+
+    On the benchmark shop's filters, "[20] M1 [21] M2 [22] M3 [23] M4" sits on
+    one line, and qwen3.5:4b clicked [23] with text "M3", reason "clicking M3
+    chip filter". When the text of a click names exactly one element by its
+    exact visible label, and the numbered element is not it, the name wins:
+    a label is harder to get wrong than a number read off a crowded line.
+    """
+    if action.op != "click" or not action.text:
+        return None
+    wanted = " ".join(action.text.lower().split()).strip("'\" ")
+    if not wanted:
+        return None
+
+    def label(el) -> str:  # noqa: ANN001
+        return " ".join((el.text or el.name or "").lower().split())
+
+    chosen = next((el for el in elements if el.idx == action.element_idx), None)
+    if chosen is not None and label(chosen) == wanted:
+        return None
+    matches = [el for el in elements if label(el) == wanted]
+    return matches[0].idx if len(matches) == 1 else None
+
+
+def _click_signature(action: Action, obs: Observation) -> tuple[str, str, str] | None:
+    """(page path, op, label) - what a click was, independent of the query
+    string and of element numbering, both of which change as filters toggle."""
+    if action.op not in {"click", "select"} or action.element_idx is None:
+        return None
+    element = next((el for el in obs.elements if el.idx == action.element_idx), None)
+    if element is None:
+        return None
+    path = urlsplit(obs.url or "").path.rstrip("/") or "/"
+    return (path, action.op, element.label(60).lower())
 
 
 def _page_key(url: str) -> str:

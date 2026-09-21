@@ -100,6 +100,114 @@ _COLLECT_JS = r"""
 }
 """
 
+#: Reads the page the way a person would: in order, content first.
+#:
+#: What the LLM used to get was the first 1,200 characters of body.innerText
+#: plus twelve pre-ranked elements. The first 1,200 characters of a shop are
+#: its header - "Sign in", "Deals", a promo banner - so the listings and prices
+#: a goal was about were never in front of the model at all.
+#:
+#: This walks the DOM in reading order, writes each interactive element inline
+#: as "[idx] label" where it sits (the numbers match _COLLECT_JS, so it must
+#: run after it), and files anything inside header/nav/footer/aside into a
+#: second buffer that only gets whatever budget the content leaves over.
+#:
+#: Measured on the benchmark shop's first results page: the old input was the
+#: header and a promo banner; this is all ten listings with spec, condition
+#: and price, sort and pagination, in about 1,900 characters.
+_READ_JS = r"""
+({ budget }) => {
+  const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'CANVAS', 'HEAD', 'IFRAME', 'OBJECT']);
+  const BLOCK = new Set(['ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIELDSET',
+    'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'HR', 'LI',
+    'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION', 'TABLE', 'TBODY', 'THEAD', 'TR', 'UL', 'BR', 'DETAILS']);
+  // Not aside/complementary: on a shop that is where the filters live, and
+  // "Used" and "96GB" are the most useful controls on the page.
+  const CHROME = 'header, nav, footer, [role=banner], [role=navigation], [role=contentinfo]';
+  const squash = (s, n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+
+  const make = () => ({ lines: [], cur: '' });
+  const main = make(), chrome = make();
+  const flush = (b) => { const t = b.cur.trim(); if (t && t !== b.lines[b.lines.length - 1]) b.lines.push(t); b.cur = ''; };
+  const put = (b, s) => { if (s) b.cur += (b.cur && !b.cur.endsWith(' ') ? ' ' : '') + s; };
+
+  const hidden = (el) => {
+    if (el.getAttribute('aria-hidden') === 'true' || el.hidden) return true;
+    const s = getComputedStyle(el);
+    return s.display === 'none' || s.visibility === 'hidden';
+  };
+
+  const describe = (el) => {
+    const tag = el.tagName;
+    const idx = el.getAttribute('data-vb-idx');
+    const label = squash(el.getAttribute('aria-label') || el.getAttribute('title') || '', 80);
+    if (tag === 'INPUT' || tag === 'TEXTAREA') {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'checkbox' || type === 'radio') {
+        return `[${idx}] (${type}${el.checked ? ', checked' : ''}) ${label}`.trim();
+      }
+      const what = label || squash(el.getAttribute('placeholder') || el.name || '', 60);
+      const value = type === 'password' ? '' : squash(el.value || '', 60);
+      return `[${idx}] (${type === 'search' ? 'search box' : 'text box'} "${what}"${value ? `, contains "${value}"` : ''})`;
+    }
+    if (tag === 'SELECT') {
+      const chosen = el.selectedOptions && el.selectedOptions[0] ? squash(el.selectedOptions[0].text, 50) : '';
+      return `[${idx}] (dropdown ${label ? '"' + label + '" ' : ''}set to "${chosen}")`;
+    }
+    const text = squash(el.innerText || el.getAttribute('alt') || label, 140);
+    const role = el.getAttribute('role');
+    const kind = tag === 'BUTTON' || role === 'button' ? '(button) ' : '';
+    // Which filter, tab or sort is already on. Without it the model clicked
+    // "Used" again "to verify it is active" - which turned it off.
+    const current = el.getAttribute('aria-current');
+    const on = (current && current !== 'false') || el.getAttribute('aria-selected') === 'true'
+      || el.getAttribute('aria-pressed') === 'true' || el.getAttribute('aria-checked') === 'true';
+    return `[${idx}] ${kind}${text || '(unlabelled)'}${on ? ' (selected - clicking it again turns it off)' : ''}`;
+  };
+
+  const walk = (node, buf, inChrome) => {
+    if (node.nodeType === Node.TEXT_NODE) { put(buf, squash(node.nodeValue, 10000)); return; }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node;
+    if (SKIP.has(el.tagName) || el.id === '__vb_layer' || hidden(el)) return;
+
+    const chromeHere = inChrome || el.matches(CHROME);
+    const target = chromeHere ? chrome : main;
+    const block = BLOCK.has(el.tagName);
+    if (block || target !== buf) flush(buf);
+
+    if (el.hasAttribute('data-vb-idx')) {
+      // One element per line. "[20] M1 [21] M2 [22] M3 [23] M4" on a single
+      // line had qwen3.5:4b click [23] while saying it was clicking M3, in
+      // two separate runs. A number on its own line cannot be misattributed.
+      flush(target);
+      put(target, describe(el));
+      flush(target);
+      return;  // its text is in the label already
+    }
+    if (/^H[1-6]$/.test(el.tagName)) { flush(target); put(target, '#'.repeat(Number(el.tagName[1])) + ' '); }
+    else if (el.tagName === 'LI') put(target, '-');
+    else if (el.tagName === 'TD' || el.tagName === 'TH') put(target, '|');
+
+    for (const child of el.childNodes) walk(child, target, chromeHere);
+    if (block) flush(target);
+  };
+
+  if (document.body) walk(document.body, main, false);
+  flush(main); flush(chrome);
+
+  const mainText = main.lines.join('\n');
+  const chromeText = chrome.lines.join('\n');
+  const room = Math.max(0, budget - mainText.length);
+  let out = mainText.slice(0, budget);
+  if (mainText.length > budget) out += `\n[... ${mainText.length - budget} more characters of page content not shown]`;
+  if (room > 200 && chromeText) {
+    out += '\n\n--- page header, menus and footer ---\n' + chromeText.slice(0, room);
+  }
+  return { text: out, total: mainText.length + chromeText.length };
+}
+"""
+
 #: Draws numbered boxes so a vision model can map what it sees to an index.
 #: Injected per frame, so boxes for elements inside an iframe are drawn by that
 #: iframe and land in the right place on the page screenshot.
@@ -205,7 +313,15 @@ class BrowserSession:
 
     # ------------------------------------------------------------- perception
 
-    async def observe(self, max_elements: int = 150, screenshot: bool = True) -> Observation:
+    async def observe(
+        self, max_elements: int = 300, screenshot: bool = True, read_chars: int = 0
+    ) -> Observation:
+        """read_chars > 0 also reads the page for the LLM (see _READ_JS).
+
+        max_elements went from 150 to 300 with it. Elements are numbered in
+        document order, so on a long page everything past the 150th - the
+        lower listings, pagination, the footer - could be read but not clicked.
+        """
         page = self._live_page()
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=self.cfg.nav_timeout_ms)
@@ -254,16 +370,41 @@ class BrowserSession:
                     )
                 )
 
+        page_text, page_total = "", 0
+        if read_chars > 0:
+            page_text, page_total = await self._read(page, read_chars)
+
         shot = await self.screenshot() if screenshot else None
         return Observation(
             url=url,
             title=title,
             elements=elements,
             text_digest=" ".join(texts),
+            page_text=page_text,
+            page_text_total=page_total,
             screenshot_png=shot,
             tabs=self.tabs(),
             active_tab=self._active_tab,
         )
+
+    async def _read(self, page: Page, budget: int) -> tuple[str, int]:
+        """The main document gets the budget; iframes share what is left."""
+        parts: list[str] = []
+        total = 0
+        for frame_id, frame in enumerate(self._collectable_frames(page)):
+            room = budget - sum(len(p) for p in parts)
+            if room < 300:
+                break
+            try:
+                raw = await frame.evaluate(_READ_JS, {"budget": room if frame_id == 0 else min(room, 1500)})
+            except PlaywrightError as exc:
+                log.debug("frame %s not readable: %s", frame_id, exc)
+                continue
+            text = raw.get("text", "")
+            total += int(raw.get("total", 0))
+            if text:
+                parts.append(text if frame_id == 0 else f"\n--- iframe {frame_id} ---\n{text}")
+        return "".join(parts), total
 
     def _collectable_frames(self, page: Page) -> list[Frame]:
         """Main frame first, then iframes. Detached and blank frames are dropped."""

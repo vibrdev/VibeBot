@@ -6,7 +6,7 @@ import base64
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
@@ -15,26 +15,55 @@ from ..schema import Element, Observation
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are the reasoning half of a browser agent.
+SYSTEM_PROMPT = """You are the reasoning half of a browser agent working for a user.
+A fast model (Laya) takes the obvious clicks; you are called for everything that
+needs reading or judgement. You see one page at a time.
 
-A fast local model (Laya) handles the obvious steps. You are called only when it
-is unsure, so the step in front of you is genuinely ambiguous. Think, then act.
-
-You get: the user's goal, the current page, a numbered list of interactive
-elements, and (when available) a screenshot with those numbers drawn on it.
+Each step you get:
+- GOAL: what the user wants.
+- NOTES: facts you saved on earlier pages. They are ALL you remember of pages you
+  have left - anything you did not save is gone.
+- PAGE: the current page as text, in reading order. Everything you can act on
+  appears inline as [number] label. The site's header, menus and footer come last.
+- A screenshot of the visible part of the page, when available.
+- STEPS SO FAR, and why you were called.
 
 Reply with ONE JSON object and nothing else:
 
 {
+  "seen": "<what on THIS page matters for the goal: names, prices, counts, which filters are on>",
   "op": "click|type|select|scroll|navigate|back|wait|extract|switch_tab|close_tab|ask_user|done|fail",
-  "element_idx": <number from the list, or null>,
+  "element_idx": <a [number] from PAGE, or null>,
   "text": "<text to type / option to select / url / tab number / question / final answer>",
+  "notes": ["<any other fact worth keeping for later>"],
   "reason": "<one short sentence>",
   "confidence": <0.0-1.0>
 }
 
+Always fill in "seen" first - look before you act. It is saved to NOTES for you.
+
+How to work:
+- Read PAGE first. The answer, or the control you need, is often already on it.
+- Use the site's own tools. Search, filters and "sort by price" beat scrolling
+  through everything.
+- Search with two to four key words ("macbook pro"), then narrow with the
+  site's filters. A whole sentence as a search usually finds nothing. If a
+  search or filter leaves no results, loosen it rather than add more.
+- Filters are often toggles: clicking an active one (shown in bold or
+  "selected") turns it off again. Check what is already applied.
+- Save what you find in "notes" as you find it, e.g.
+  "Used MacBook Pro 16in M2 Max 96GB 2TB - 21,450 SEK (seller nordic_macs)".
+  Leave "notes" empty when there is nothing new.
+- For "cheapest", "most", "how many" or "all": be sure you have seen every
+  candidate - every page of results, or a list sorted by what you compare.
+- Check every condition in the goal against each candidate. Memory (RAM,
+  unified memory) is not storage (SSD, TB). New, used, refurbished and "for
+  parts" are different conditions.
+- When you have the answer, reply "done" with the exact answer in "text" -
+  numbers, prices and names as the page shows them.
+
 Rules:
-- Only use element_idx values that appear in the list.
+- Only use element_idx values that appear as [number] in PAGE.
 - "type" needs both element_idx and text. It submits with Enter afterwards.
 - Elements marked "(iframe N)" live inside an embedded frame. Act on them
   normally — the index is all you need.
@@ -62,6 +91,16 @@ class LLMAction:
     read back afterwards instead of guessed at."""
     prompt: str = ""
     """The prompt that produced it. Same reason."""
+    notes: list[str] = field(default_factory=list)
+    """Facts the model asked to keep. The agent carries them from page to page;
+    without them it could not compare a listing on page 1 with one on page 3."""
+    seen: str = ""
+    """What the model says this page shows, written before it picks an action.
+
+    Optional notes did not work with qwen3.5:4b: over two benchmark rounds it
+    saved two notes in 67 steps. Small models reliably fill in whatever comes
+    first in the reply format, so observation is now the first field and the
+    agent files it into memory itself."""
 
 
 class LLM(Protocol):
@@ -89,6 +128,45 @@ class LLM(Protocol):
     async def close(self) -> None: ...
 
 
+#: A page that says it found nothing.
+NO_RESULTS = re.compile(
+    r"\b(?:0|no|zero)\s+(?:results?|listings?|items?|matches|products?|hits)\b"
+    r"|no listings match|did not match any|nothing (?:was )?found|no results found",
+    re.I,
+)
+
+
+_SEARCH_BOX = re.compile(r"^\[(\d+)\] \(search box", re.M)
+_QUERY_KEYS = ("q", "query", "search", "k", "keyword", "keywords", "_nkw", "term", "s")
+
+
+def _no_results_alert(obs: Observation) -> str:
+    """Say what to change, not just that nothing was found.
+
+    A vaguer version ("broaden the search or remove a filter") backfired: the
+    search "used MacBook Pro M-series" matched nothing because no title says
+    "M-series", the model chose "remove a filter", still saw no results, and
+    clicked the one filter it knew on and off eleven times. It never touched
+    the search box. So name the words and the box.
+    """
+    from urllib.parse import parse_qs, urlsplit  # noqa: PLC0415
+
+    params = parse_qs(urlsplit(obs.url or "").query)
+    query = next((params[k][0] for k in _QUERY_KEYS if params.get(k) and params[k][0].strip()), "")
+    box = _SEARCH_BOX.search(obs.page_text or "")
+    where = f" in the search box [{box.group(1)}]" if box else ""
+    if query:
+        return (
+            f'!! THIS PAGE SHOWS NO RESULTS. The search "{query}" matches nothing - the words '
+            f"themselves are the problem, so no filter can fix it. Type a shorter search{where}: "
+            "just the product (e.g. two words), then narrow with filters."
+        )
+    return (
+        "!! THIS PAGE SHOWS NO RESULTS. Adding filters to an empty list cannot help. Remove a "
+        f"filter, or search again with fewer words{where}."
+    )
+
+
 def render_prompt(
     goal: str,
     obs: Observation,
@@ -105,15 +183,25 @@ def render_prompt(
     if len(obs.tabs) > 1:
         lines += ["", f"TABS ({len(obs.tabs)} open, * = current):"]
         lines += [f"  {tab.label()}" for tab in obs.tabs]
-    lines += ["", "ELEMENTS:"]
-    lines += [f"  [{el.idx}] {el.label(110)}" for el in candidates]
-    lines += [
-        "",
-        "VISIBLE TEXT (truncated):",
-        " ".join(obs.text_digest.split())[:1200],
-        "",
-        "STEPS SO FAR:",
-    ]
+    lines += ["", "NOTES:"]
+    lines += [f"  - {item}" for item in obs.memory] or ["  (nothing saved yet)"]
+    if obs.page_text and NO_RESULTS.search(obs.page_text):
+        lines += ["", _no_results_alert(obs)]
+    if obs.page_text:
+        shown = len(obs.page_text)
+        extent = (
+            f"all {obs.page_text_total} characters"
+            if obs.page_text_total <= shown
+            else f"{shown} of {obs.page_text_total} characters"
+        )
+        lines += ["", f"PAGE ({extent}):", obs.page_text]
+    else:
+        # No reader (it failed, or was turned off): the old view, a short
+        # element list and the top of the page.
+        lines += ["", "ELEMENTS:"]
+        lines += [f"  [{el.idx}] {el.label(110)}" for el in candidates]
+        lines += ["", "VISIBLE TEXT (truncated):", " ".join(obs.text_digest.split())[:1200]]
+    lines += ["", "STEPS SO FAR:"]
     lines += [f"  {i + 1}. {item}" for i, item in enumerate(history[-8:])] or ["  (none)"]
     if note:
         lines += ["", f"WHY YOU WERE CALLED: {note}"]
@@ -146,7 +234,33 @@ def parse_action(content: str) -> LLMAction:
         reason=str(data.get("reason") or ""),
         confidence=max(0.0, min(1.0, confidence)),
         raw=text[:2000],
+        notes=_as_notes(data.get("notes", data.get("note", data.get("remember")))),
+        seen=" ".join(str(data.get("seen") or data.get("observation") or "").split())[:400],
     )
+
+
+def _as_notes(value: Any) -> list[str]:
+    """Whatever the model put under "notes", as a clean list of short strings.
+
+    Small models are loose about shape: a list, one string, a dict of
+    label -> fact, or null all turn up. None of them should cost a step.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, dict):
+        items = [f"{k}: {v}" for k, v in value.items()]
+    elif isinstance(value, (list, tuple)):
+        items = [json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v) for v in value]
+    else:
+        items = [str(value)]
+    cleaned = []
+    for item in items:
+        item = " ".join(item.split())[:300]
+        if item and item.lower() not in {"none", "null", "n/a", "-"}:
+            cleaned.append(item)
+    return cleaned[:8]
 
 
 def _as_element_idx(value: Any) -> int | None:

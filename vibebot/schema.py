@@ -75,6 +75,17 @@ class Observation:
     title: str
     elements: list[Element]
     text_digest: str = ""
+    """The top of body.innerText, flat. Laya's input: its context is 512-1,024
+    tokens, so it only ever gets the first few hundred characters of this."""
+    page_text: str = ""
+    """The page in reading order with every element's number inline and the
+    menus moved to the end. The LLM's input - see browser._READ_JS."""
+    page_text_total: int = 0
+    """How long page_text would have been with no budget, so a prompt can say
+    how much it is not showing."""
+    memory: list[str] = field(default_factory=list)
+    """Facts saved on earlier pages this run. Carried on the observation so
+    every LLM backend sees them without its decide() signature changing."""
     screenshot_png: bytes | None = None
     annotated_png: bytes | None = None
     step: int = 0

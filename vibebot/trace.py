@@ -84,6 +84,10 @@ class Trace:
         for call in llm_calls:
             self.note(f"    llm ask    : {call.get('note', '')[:160]}")
             self.note(f"    llm reply  : {str(call.get('raw', ''))[:400]}")
+            if call.get("seen"):
+                self.note(f"    SAW        : {str(call['seen'])[:300]}")
+            for saved in call.get("notes") or []:
+                self.note(f"    REMEMBERED : {saved[:200]}")
         for ask in record.get("asked_you", []):
             # A run someone sat and approved used to read back as if they had
             # never been there at all.
