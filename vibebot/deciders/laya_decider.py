@@ -1,9 +1,23 @@
 """Laya: local, free, calibrated probabilities, no tokens generated.
 
-Measured, not quoted from the README: one batched step costs ~0.3s on a laptop
-CPU with a short page digest and ~1.5-2.5s with the default 600-character one.
-The advertised 33ms is a single question on a T4 GPU. Either way it is an order
-of magnitude cheaper than waking a 7B vision model.
+Measured on an i7-11370H, CPU only, four typed questions in one batch, with
+the weights already warm. The earlier figures in this docstring (~0.3s short,
+1.5-2.5s at the default digest) were optimistic by roughly a factor of three:
+
+    page_text_chars    0    3.70s
+                     100    4.10s
+                     200    4.48s
+                     400    5.03s
+                     600    5.84s   <- the default
+                    1000    7.10s
+
+So a step costs about 3.7s before it reads a single character of the page, and
+another 3.4s per thousand characters after that. The candidate list is nearly
+free by comparison: 4 options 5.11s, 20 options 5.84s, which is why the
+pre-ranking limit can be generous and the text budget cannot.
+
+The advertised 33ms is a single question on a T4 GPU. Even at 5.8s this is
+still several times cheaper than waking the vision model, which takes 20-30s.
 
 We ask it four typed questions per step in a single forward pass:
 
@@ -21,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from typing import Any
 
@@ -49,6 +64,9 @@ class LayaDecider:
         #: memory guard has to hold until that has actually happened.
         self._warm = False
         self._failures = 0
+        #: predict() is a torch forward pass; one at a time. The background
+        #: warm-up and the first real step must not race into it together.
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ setup
 
@@ -105,6 +123,37 @@ class LayaDecider:
             "often several GB more) or lower the floor to try anyway."
         )
 
+    def warm(self) -> None:
+        """Start loading the weights now, in the background.
+
+        Lazy loading moved a ~35s load off startup and onto the first step,
+        where it is the only thing happening and you watch all of it. Chromium
+        starting and the first LLM call together take longer than the load, so
+        run it alongside them instead and the wait disappears.
+        """
+        if self._agent is None or self._warm or self._error:
+            return
+
+        def load() -> None:
+            with self._lock:
+                if self._warm:
+                    return
+                if self._memory_shortfall():
+                    return  # decide() will report it properly on the first step
+                started = time.perf_counter()
+                try:
+                    self._agent.predict(
+                        {"goal": "warm up", "page_text": ""},
+                        {"warm": {"type": "noul", "instructions": "ready?"}},
+                    )
+                except Exception as exc:  # noqa: BLE001 - a failed warm is not fatal
+                    log.debug("Laya warm-up failed, first step will pay for it: %s", exc)
+                    return
+                self._warm = True
+                log.info("Laya warm after %.1fs", time.perf_counter() - started)
+
+        threading.Thread(target=load, name="laya-warm", daemon=True).start()
+
     @property
     def error(self) -> str | None:
         return self._error
@@ -138,10 +187,14 @@ class LayaDecider:
         state = build_state(goal, obs, history, self.cfg.page_text_chars)
         questions = self._questions(candidates, text_options, len(obs.tabs))
 
+        def predict() -> Any:
+            with self._lock:  # never two forward passes at once
+                return self._agent.predict(state, questions)
+
         started = time.perf_counter()
         try:
             # torch is blocking; keep the event loop (and the live UI) responsive.
-            result = await asyncio.to_thread(self._agent.predict, state, questions)
+            result = await asyncio.to_thread(predict)
         except Exception as exc:  # noqa: BLE001 - never let the brain kill the run
             self._failures += 1
             memory = snapshot()

@@ -319,6 +319,29 @@ The rows are also labelled training data — every step where Laya deferred and
 the LLM picked correctly is a fine-tuning example for making Laya handle *your*
 sites without the LLM.
 
+## Measuring it
+
+Every change to the agent used to be argued from one run, which is how a fix
+that helps one goal and quietly breaks two others gets shipped. So there is a
+benchmark:
+
+```
+python -m vibebot bench                       # the default suite, once
+python -m vibebot bench --repeat 3            # three rounds, for variance
+python -m vibebot bench --page-text-chars 200 --out after.json
+python -m vibebot bench --model qwen3.5:9b
+```
+
+It runs a fixed set of short goals with one checkable answer each, headless,
+and reports whether each answer matched, how many steps and seconds it took,
+how many steps Laya decided on its own, and how many LLM calls it cost.
+
+It will **refuse to run** if Laya could not load and the heuristic fallback
+stood in. That is not paranoia: one early benchmark ran entirely on the
+fallback, because memory from a previous run had not been released, and its
+numbers looked perfectly healthy. `--allow-degraded` measures the fallback on
+purpose.
+
 ## Memory
 
 The thing most likely to break a run on a laptop is not the model size, it is

@@ -88,6 +88,12 @@ class Agent:
     # ------------------------------------------------------------- lifecycle
 
     async def start(self) -> dict[str, Any]:
+        # Kick the weights off first: loading them takes about as long as
+        # everything else in this method put together, and none of it needs
+        # them, so the load is free if it happens alongside.
+        warm = getattr(self.decider, "warm", None)
+        if warm:
+            warm()
         await self.browser.start()
         status = {
             "decider": self.decider.name,
@@ -188,7 +194,11 @@ class Agent:
                 continue
 
             candidates = rank_candidates(
-                obs.elements, self.goal, self._history, limit=self.cfg.decider.max_candidates
+                obs.elements,
+                self.goal,
+                self._history,
+                limit=self.cfg.decider.max_candidates,
+                url=obs.url,
             )
             shot = await self.browser.screenshot(highlight=[el.idx for el in candidates])
             obs.annotated_png = shot
@@ -365,8 +375,17 @@ class Agent:
 
         # 3a. "It's in another tab." With exactly two open there is nothing to
         #     reason about; with more, the LLM picks which one.
-        if verdict.target == "switch_tab" and confident and len(obs.tabs) == 2:
-            other = 1 - obs.active_tab
+        other_tab = 1 - obs.active_tab if len(obs.tabs) == 2 else -1
+        if (
+            verdict.target == "switch_tab"
+            and confident
+            and other_tab >= 0
+            # A blank tab has nothing in it to find. A run began with two
+            # about:blank tabs left over from an earlier goal, and Laya spent
+            # its first two steps switching between them at p=0.72 and 0.88.
+            and obs.tabs[other_tab].url not in ("", "about:blank")
+        ):
+            other = other_tab
             return (
                 Action(
                     op="switch_tab",
@@ -411,7 +430,7 @@ class Agent:
         # 4. Everything else is the LLM's problem.
         if verdict.wants_llm:
             note = "Laya deferred this step to you."
-        elif verdict.target == "done":
+        elif verdict.target == "done" and _page_key(obs.url) in self._not_done:
             # Reporting p=98% as "below the acceptance gate" was simply false:
             # the gate never looked at it, because this page had already been
             # asked about and the answer was no.
@@ -419,6 +438,17 @@ class Agent:
                 f"Laya says the goal is met ({verdict.p_top:.0%}), but you have already "
                 "been asked about this page and said it is not finished. Do not answer "
                 "again — choose the action that gets closer."
+            )
+        elif verdict.target == "done":
+            # Laya leans towards "finished" but not far enough for the done
+            # check. The note above used to be sent here too, claiming a prior
+            # ask that never happened: on example.com, whose text holds the
+            # answer, the LLM was told not to answer, wandered off to iana.org
+            # and a benchmark goal failed on a page it had already solved.
+            note = (
+                f"Laya leans towards the goal already being met here ({verdict.p_top:.0%}) "
+                "but is not sure. If what the goal asks for is on this page, reply 'done' "
+                "with that exact value; otherwise choose the next action."
             )
         else:
             note = (
@@ -449,7 +479,9 @@ class Agent:
         decision = await self._escalate(obs, candidates, note)
         return await self._use_llm_decision(decision, obs, candidates)
 
-    async def _use_llm_decision(self, decision, obs: Observation, candidates: list) -> tuple[Action, str]:  # noqa: ANN001
+    async def _use_llm_decision(
+        self, decision, obs: Observation, candidates: list, retry: bool = True  # noqa: ANN001
+    ) -> tuple[Action, str]:
         """Turn one LLM reply into the step's action."""
         if decision.op == "ask_user":
             question = decision.text or "I am not sure how to continue. What should I do?"
@@ -465,6 +497,22 @@ class Agent:
             action.op, _ = _coerce_operation(
                 action.op, element, action.text, text_is_deliberate=True
             )
+        if (
+            retry
+            and element is not None
+            and (_page_key(obs.url), action.op, action.element_idx) in self._tried
+        ):
+            # Told that Laya's repeat of "Wikipedia" had got nowhere, the LLM
+            # chose "Wikipedia" itself, three times in one run. Hold it to the
+            # same rule once; if it insists a second time, it may know better.
+            again = await self._escalate(
+                obs,
+                candidates,
+                f"You chose to {action.op} {element.label(60)}, which has already been "
+                "done on this page without getting anywhere. Choose a different element "
+                "or a different action.",
+            )
+            return await self._use_llm_decision(again, obs, candidates, retry=False)
         return await self._risk_gate(action, obs), "llm"
 
     async def _escalate(self, obs: Observation, candidates: list, note: str):

@@ -91,8 +91,34 @@
   #ask .inline { display: flex; gap: 8px; }
   #answer { flex: 1; background: #0b0d10; border: 1px solid var(--line); color: var(--text);
             border-radius: 8px; padding: 8px 10px; font: inherit; }
+  #result {
+    display: none; margin: 0 0 10px; padding: 12px 14px; border-radius: 10px;
+    border: 1px solid var(--line); background: #0b0d10;
+  }
+  #result.show { display: block; }
+  #result.good { border-color: #1f5e42; background: #0c1a14; }
+  #result.bad  { border-color: #5b2330; background: #1a0d11; }
+  #result .r-head {
+    display: flex; align-items: center; gap: 8px;
+    font: 600 11px/1 inherit; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px;
+  }
+  #result .r-answer { font-size: 15px; line-height: 1.45; word-break: break-word; }
+  #result button {
+    margin-left: auto; padding: 4px 9px; font-size: 11px;
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+  }
+  #foot b { color: var(--text); font-weight: 600; }
   footer { padding: 8px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); } }
+  @media (max-width: 760px) {
+    header { flex-wrap: wrap; row-gap: 8px; }
+    #goal { flex: 1 1 100%; order: 2; }
+    header b { order: 1; margin-right: auto; }
+    header button, header .spacer { order: 3; }
+    header .spacer { display: none; }
+    header button { flex: 1 1 auto; padding: 9px 10px; }
+  }
 </style>
 </head>
 <body>
@@ -102,7 +128,7 @@
   <button id="go">Run</button>
   <button id="live" class="ghost" title="Stream the browser continuously instead of once per step">Live ○</button>
   <button id="pause" class="ghost">Pause</button>
-  <button id="stop" class="ghost" title="Stop the current goal (VibeBot keeps running)">Stop</button>
+  <button id="stop" class="ghost" title="Stop this goal. VibeBot stays running, ready for the next one.">Stop goal</button>
   <span class="spacer"></span>
   <button id="quit" class="ghost danger" title="Shut VibeBot down and close the browser it drives">Quit</button>
 </header>
@@ -127,6 +153,10 @@
       <span class="pill" id="p-decider">decider ?</span>
       <span class="pill" id="p-llm">llm ?</span>
       <div id="p-url" style="margin-top:6px"></div>
+    </div>
+    <div id="result">
+      <div class="r-head"><span id="r-status">finished</span><button id="r-copy">copy</button></div>
+      <div class="r-answer" id="r-answer"></div>
     </div>
     <div id="feed"></div>
     <div id="ask">
@@ -190,19 +220,19 @@ function handle(e) {
   switch (e.type) {
     case 'quitting': quitting = true; showShutdown(); break;
     case 'status':
+      if (e.running) setRunning(true);
       $('p-decider').textContent = 'decider: ' + e.decider;
       $('p-llm').textContent = 'llm: ' + e.llm + (e.llm_ready ? '' : ' ⚠');
       if (e.degraded_from) add('bad', 'Fast decider unavailable', e.degraded_from.join(': '));
       if (!e.llm_ready) add('bad', 'LLM not ready', e.llm_message);
       break;
-    case 'run_start': add('user', 'GOAL: ' + e.goal); $('foot').textContent = 'running…'; break;
+    case 'run_start': add('user', 'GOAL: ' + e.goal); beginRun(); break;
     case 'observation':
       $('p-url').textContent = e.title ? e.title + ' — ' + e.url : e.url;
       // In live mode the stream owns the stage; don't fight it with stale stills.
       if (e.screenshot && !liveOn) showImage(e.screenshot);
       if (e.tabs) drawTabs(e.tabs);
-      $('foot').textContent = `step ${e.step} · ${e.candidates.length} candidates`
-        + (e.frames > 1 ? ` · ${e.frames} frames` : '') + (e.tabs && e.tabs.length > 1 ? ` · ${e.tabs.length} tabs` : '');
+      lastStep = e.step; footer();
       break;
     case 'frame':
       showImage(e.image);
@@ -218,7 +248,7 @@ function handle(e) {
       add('laya', `${e.target} · p ${pct(e.p_top)} (+${pct(e.margin)}) · ${e.operation}`,
           `${e.latency_ms}ms · done ${pct(e.done_p)} · risky ${pct(e.risky_p)}`, e.p_top);
       break;
-    case 'thinking': add('llm', 'escalated to LLM', e.note); break;
+    case 'thinking': add('llm', 'escalated to LLM', e.note); llmCalls = e.calls || llmCalls + 1; footer(); break;
     case 'llm': add('llm', `${e.op}${e.element_idx != null ? ' → [' + e.element_idx + ']' : ''}`, e.reason || e.text); break;
     case 'acted': add(e.source === 'laya' ? 'laya' : e.source === 'llm' ? 'llm' : 'user', e.action, e.outcome); break;
     case 'question': showAsk(e.question); break;
@@ -229,10 +259,54 @@ function handle(e) {
     case 'log': add('user', e.message); break;
     case 'run_end':
       add(e.status === 'done' ? 'user' : 'bad', 'FINISHED: ' + e.status, e.summary);
-      $('foot').textContent = e.status + ' — ' + (e.summary || '');
+      endRun(e.status, e.summary);
       break;
   }
 }
+let runStarted = 0, llmCalls = 0, lastStep = 0, ticker = null;
+
+function since(ms) {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+}
+
+function footer() {
+  if (!runStarted) return;
+  const bits = [];
+  if (lastStep) bits.push('step <b>' + lastStep + '</b>');
+  bits.push(since(Date.now() - runStarted));
+  bits.push(llmCalls + ' llm call' + (llmCalls === 1 ? '' : 's'));
+  $('foot').innerHTML = bits.join(' · ');
+}
+
+function setRunning(on) {
+  $('go').disabled = on;
+  $('go').textContent = on ? 'Running…' : 'Run';
+  $('stop').disabled = !on;
+}
+
+function beginRun() {
+  runStarted = Date.now(); llmCalls = 0; lastStep = 0;
+  $('result').className = '';
+  clearInterval(ticker);
+  ticker = setInterval(footer, 1000);
+  setRunning(true);
+  footer();
+}
+
+function endRun(status, summary) {
+  clearInterval(ticker); ticker = null;
+  const ok = status === 'done';
+  const words = { done: 'answer', max_steps: 'ran out of steps', failed: 'gave up', stopped: 'stopped', error: 'something broke' };
+  $('r-status').textContent = words[status] || status;
+  $('r-answer').textContent = summary || '(nothing came back)';
+  $('result').className = 'show ' + (ok ? 'good' : 'bad');
+  const took = runStarted ? ' in ' + since(Date.now() - runStarted) : '';
+  $('foot').innerHTML = '<b>' + status + '</b>' + took + ' · ' + llmCalls + ' llm calls';
+  setRunning(false);
+  runStarted = 0;
+}
+
 const pct = (v) => Math.round((v || 0) * 100) + '%';
 
 function showImage(src) {
@@ -259,6 +333,7 @@ const send = (obj) => socket && socket.readyState === 1 && socket.send(JSON.stri
 $('go').onclick = () => { const g = $('goal').value.trim(); if (g) { feed.innerHTML = ''; send({ type: 'run', goal: g }); } };
 $('goal').onkeydown = (e) => { if (e.key === 'Enter') $('go').click(); };
 $('stop').onclick = () => send({ type: 'stop' });
+$('r-copy').onclick = () => navigator.clipboard && navigator.clipboard.writeText($('r-answer').textContent);
 $('quit').onclick = () => {
   if (!confirm('Shut VibeBot down completely? This closes the browser it drives and stops the server.')) return;
   quitting = true;
@@ -272,6 +347,7 @@ $('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ?
 $('send').onclick = () => { send({ type: 'answer', text: $('answer').value }); hideAsk(); };
 $('answer').onkeydown = (e) => { if (e.key === 'Enter') $('send').click(); };
 
+setRunning(false);
 connect();
 </script>
 </body>

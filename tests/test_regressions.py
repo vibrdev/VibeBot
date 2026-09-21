@@ -496,3 +496,215 @@ def test_risk_gate_interrupts_for_consequences_not_for_confidence():
     assert interrupts(Element(idx=1, tag="input", input_type="checkbox"), "click", 0.87)
     assert interrupts(Element(idx=9, tag="input", role="textbox", name="Card number"), "type", 0.87)
     assert interrupts(Element(idx=4, tag="a", text="Remove", href="javascript:void(0)"), "click", 0.80)
+
+
+# --------------------------------------------------------------- benchmark
+
+def test_benchmark_scores_the_answer_not_the_status():
+    from vibebot.bench import Task
+
+    task = Task("eiffel", "…", r"\b1889\b")
+    assert task.passed("The Eiffel Tower was completed in 1889.")
+    assert not task.passed("I found a page about the Eiffel Tower.")
+    assert not task.passed("")
+
+
+def test_benchmark_matching_ignores_case_and_surrounding_words():
+    from vibebot.bench import Task
+
+    task = Task("python", "…", r"van rossum")
+    assert task.passed("It was created by Guido van Rossum in 1991.")
+    assert task.passed("GUIDO VAN ROSSUM")
+
+
+def test_benchmark_summary_reports_what_changed_between_runs():
+    from vibebot.bench import Report, Result
+
+    report = Report([
+        Result("a", True, "done", 2, 70.9, 0.0, 2, "x", ""),
+        Result("b", False, "max_steps", 10, 190.0, 0.5, 8, "y", ""),
+    ])
+    summary = report.summary()
+    assert summary["passed"] == 1
+    assert summary["pass_rate"] == 0.5
+    assert summary["median_steps"] == 6
+    assert summary["llm_calls"] == 10
+    assert summary["laya_share"] == 0.25
+
+
+def test_every_benchmark_goal_has_something_to_check():
+    """A suite entry with no expectation always passes, which is worse than
+    having no benchmark at all."""
+    from vibebot.bench import SUITE
+
+    assert SUITE
+    for task in SUITE:
+        assert task.expect.strip(), task.name
+        assert task.goal.strip(), task.name
+        assert task.max_steps > 0, task.name
+
+
+# ------------------------------------------- what the LLM is told, exactly
+
+def _resolve_note(verdict, url, not_done=()):
+    """Run the real _resolve and capture the note it would send the LLM."""
+    import asyncio
+
+    from vibebot.agent import Agent, _page_key
+    from vibebot.config import Config
+    from vibebot.schema import Observation
+
+    agent = Agent.__new__(Agent)
+    agent.cfg = Config()
+    agent.goal = "go to example.com and tell me which organisation the domain is reserved by"
+    agent._drifted = ""
+    agent._just_navigated = False
+    agent._not_done = {_page_key(u) for u in not_done}
+    agent._tried = set()
+    agent._scrolls = {}
+    seen: list[str] = []
+
+    async def capture(obs, candidates, note):
+        seen.append(note)
+        return None, "llm"
+
+    agent._llm_step = capture
+    obs = Observation(url=url, title="Example Domain", elements=[])
+    asyncio.run(agent._resolve(obs, [], verdict, stalls=0))
+    return seen[0] if seen else ""
+
+
+def test_a_done_lean_on_a_fresh_page_invites_the_answer():
+    """Told "you have already been asked about this page" on its first visit,
+    the LLM declined to answer on example.com - whose text holds the answer -
+    and wandered off to iana.org until the step budget ran out."""
+    from vibebot.deciders.base import Verdict
+
+    verdict = Verdict(target="done", probabilities={"done": 0.36, "e0": 0.2}, done_p=0.7987)
+    note = _resolve_note(verdict, "https://example.com/")
+    assert "already been asked" not in note
+    assert "reply 'done'" in note
+
+
+def test_a_done_lean_on_a_page_already_refused_says_so():
+    from vibebot.deciders.base import Verdict
+
+    verdict = Verdict(target="done", probabilities={"done": 0.98, "e0": 0.01}, done_p=0.98)
+    note = _resolve_note(verdict, "https://example.com/", not_done=["https://example.com/"])
+    assert "already been asked" in note
+
+
+# ------------------------------------------------------------------ ranking
+
+def test_the_site_you_are_on_does_not_outrank_the_search_box():
+    """Measured on Wikipedia's front page: every link's href contains
+    en.wikipedia.org, the goal said "go to en.wikipedia.org", and the search
+    box ranked below twelfth - so it was never offered at all."""
+    from vibebot.ranking import rank_candidates
+
+    url = "https://en.wikipedia.org/wiki/Main_Page"
+    goal = "go to en.wikipedia.org and find what year the Eiffel Tower was completed"
+    elements = [
+        Element(idx=i, tag="a", text=t, href=f"https://en.wikipedia.org/wiki/{t.replace(' ', '_')}")
+        for i, t in enumerate(
+            ["The Arnolfini Portrait", "Northern Renaissance", "iconography", "Noemvriana",
+             "Lebanon war", "More current events", "Nominate an article", "Donate",
+             "Wikipedia", "free", "anyone can edit", "Cold spots", "Main Page"], start=2)
+    ]
+    elements.append(Element(idx=1, tag="input", name="Search Wikipedia", input_type="search"))
+    ranked = rank_candidates(elements, goal, [], limit=12, url=url)
+    assert ranked[0].idx == 1, [e.label() for e in ranked[:3]]
+
+
+def test_href_scoring_uses_the_path_not_the_host():
+    from vibebot.ranking import _href_path
+
+    assert _href_path("https://en.wikipedia.org/wiki/Eiffel_Tower") == "/wiki/Eiffel_Tower"
+    assert _href_path("/wiki/Eiffel_Tower") == "/wiki/Eiffel_Tower"
+    assert _href_path("") == ""
+
+
+def test_the_llm_is_held_to_the_repeat_rule_once():
+    """Told Laya's repeat had got nowhere, the LLM repeated it itself."""
+    import asyncio
+
+    from vibebot.agent import Agent, _page_key
+    from vibebot.config import Config
+    from vibebot.llm.base import LLMAction
+    from vibebot.schema import Observation
+
+    url = "https://en.wikipedia.org/wiki/Main_Page"
+    wiki = Element(idx=12, tag="a", text="Wikipedia", href="/wiki/Wikipedia")
+    search = Element(idx=1, tag="input", name="Search Wikipedia", input_type="search")
+    obs = Observation(url=url, title="t", elements=[wiki, search])
+
+    agent = Agent.__new__(Agent)
+    agent.cfg = Config()
+    agent.cfg.policy.autonomy = "yolo"
+    agent._tried = {(_page_key(url), "click", 12)}
+    asked: list[str] = []
+
+    async def escalate(o, c, note):
+        asked.append(note)
+        return LLMAction(op="type", element_idx=1, text="Eiffel Tower")
+
+    agent._escalate = escalate
+    action, _ = asyncio.run(
+        agent._use_llm_decision(LLMAction(op="click", element_idx=12), obs, [wiki, search])
+    )
+    assert asked and "already been done" in asked[0]
+    assert action.element_idx == 1 and action.op == "type"
+
+    # and it does not loop forever if the model insists
+    async def insist(o, c, note):
+        asked.append(note)
+        return LLMAction(op="click", element_idx=12)
+
+    agent._escalate = insist
+    asked.clear()
+    action, _ = asyncio.run(
+        agent._use_llm_decision(LLMAction(op="click", element_idx=12), obs, [wiki, search])
+    )
+    assert len(asked) == 1
+    assert action.element_idx == 12
+
+
+def test_laya_does_not_switch_into_a_blank_tab():
+    """A run began with two about:blank tabs and Laya spent two steps
+    switching between them at p=0.72 and p=0.88."""
+    from vibebot.deciders.base import Verdict
+    from vibebot.schema import TabInfo
+
+    import asyncio
+
+    from vibebot.agent import Agent
+    from vibebot.config import Config
+    from vibebot.schema import Observation
+
+    def resolve(other_url):
+        agent = Agent.__new__(Agent)
+        agent.cfg = Config()
+        agent.goal = "find something"
+        agent._drifted = ""
+        agent._just_navigated = False
+        agent._not_done, agent._tried, agent._scrolls = set(), set(), {}
+        notes: list[str] = []
+
+        async def capture(obs, candidates, note):
+            notes.append(note)
+            return None, "llm"
+
+        agent._llm_step = capture
+        obs = Observation(url="https://example.com/", title="t", elements=[])
+        obs.tabs = [TabInfo(index=0, url="https://example.com/", title="t", active=True),
+                    TabInfo(index=1, url=other_url, title="", active=False)]
+        obs.active_tab = 0
+        verdict = Verdict(target="switch_tab", probabilities={"switch_tab": 0.9, "back": 0.05})
+        action, _ = asyncio.run(agent._resolve(obs, [], verdict, stalls=0))
+        return action, notes
+
+    action, notes = resolve("about:blank")
+    assert action is None and notes  # went to the LLM instead
+
+    action, notes = resolve("https://www.iana.org/domains")
+    assert action.op == "switch_tab" and action.text == "1"

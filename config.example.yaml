@@ -26,7 +26,7 @@ decider:
                            # dies rather than raises when the OS declines a commit
                            # charge, so this trades a segfault for a warning.
   max_candidates: 12       # elements Laya chooses between (its context is small)
-  page_text_chars: 600     # page text sent to Laya; lower = faster (200 is snappy)
+  page_text_chars: 200     # page text sent to Laya: ~3.7s/step fixed + ~3.4s per 1000 chars.
   accept_probability: 0.55 # p(top option) needed to act without the LLM
   accept_margin: 0.15      # …and how far ahead of the runner-up it must be
   done_confidence: 0.80    # "goal achieved" threshold (LLM double-checks)
