@@ -35,7 +35,7 @@ def tokens(text: str) -> set[str]:
 
 def score_element(el: Element, goal_tokens: set[str], history_tokens: set[str]) -> float:
     """Higher is more likely to be the thing we want to touch next."""
-    blob = " ".join([el.text, el.name, el.placeholder, el.value, el.href, el.role, el.tag])
+    blob = " ".join([el.text, el.name, el.placeholder, el.value, _href_path(el.href), el.role, el.tag])
     el_tokens = tokens(blob)
     if not el_tokens:
         return 0.05
@@ -140,13 +140,29 @@ def text_candidates(goal: str, limit: int = 3) -> list[str]:
     return unique[:limit]
 
 
+def _href_path(href: str) -> str:
+    """The part of a link that says where it goes, not which site it is on.
+
+    Every link on a Wikipedia page is https://en.wikipedia.org/wiki/..., and a
+    goal that says "go to en.wikipedia.org" shares three words with all of
+    them. Scored on the full href, "The Arnolfini Portrait" came out at 3.75
+    and the search box at 2.85 - which is below twelfth place, so neither Laya
+    nor the LLM was ever offered the one element the goal needed.
+    """
+    match = re.match(r"^[a-z][a-z0-9+.-]*://[^/]*", href or "", re.I)
+    return (href or "")[match.end():] if match else (href or "")
+
+
 def rank_candidates(
     elements: Iterable[Element],
     goal: str,
     history: Iterable[str] = (),
     limit: int = 12,
+    url: str = "",
 ) -> list[Element]:
-    goal_tokens = tokens(goal)
+    # Words naming the site you are already on say nothing about which
+    # element on it to use.
+    goal_tokens = goal_terms(goal, url) if url else tokens(goal)
     history_tokens = tokens(" ".join(history))
     scored = sorted(
         elements,

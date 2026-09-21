@@ -78,10 +78,19 @@ class DeciderConfig:
     """How many page elements Laya is allowed to choose between. Laya's context is
     512-1024 tokens and its own docs warn about high-cardinality choices, so we
     pre-rank and truncate rather than dumping the whole DOM at it."""
-    page_text_chars: int = 600
-    """How much visible page text Laya gets. Every character is a token it pays
-    for: 600 costs roughly 1-2s per step on a laptop CPU, 200 is noticeably
-    snappier and usually enough."""
+    page_text_chars: int = 200
+    """How much visible page text Laya gets, and the main thing you can trade.
+
+    Measured on a laptop CPU with the weights warm, this is very close to
+    linear: 0 chars 3.70s, 200 4.48s, 600 5.84s, 1000 7.10s. About 3.7s of a
+    step is fixed and the rest is this number. The candidate list barely
+    registers next to it (4 options 5.11s, 20 options 5.84s).
+
+    The default was 600. Benchmarked against 200 with Laya genuinely loaded,
+    same code, same four goals: both passed the same two and failed the same
+    two, Laya decided 32% of steps either way, and 200 finished in 410s against
+    442s. One round each, so that is evidence it costs nothing rather than
+    proof it helps - `vibebot bench --page-text-chars N --repeat 3` to check."""
     accept_probability: float = 0.55
     """Minimum probability on the winning option before we act without the LLM.
 

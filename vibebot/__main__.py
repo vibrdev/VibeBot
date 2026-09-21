@@ -31,6 +31,21 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("doctor", help="check that Playwright, Laya and the LLM are usable")
 
+    bench_cmd = sub.add_parser(
+        "bench", help="score the agent against a fixed set of goals"
+    )
+    bench_cmd.add_argument("--repeat", type=int, default=1, help="rounds of the whole suite")
+    bench_cmd.add_argument("--out", help="write the numbers to this JSON file")
+    bench_cmd.add_argument(
+        "--show", action="store_true", help="watch it work instead of running headless"
+    )
+    bench_cmd.add_argument("--page-text-chars", type=int, help="override decider.page_text_chars")
+    bench_cmd.add_argument("--model", help="override llm.model")
+    bench_cmd.add_argument(
+        "--allow-degraded", action="store_true",
+        help="run even if Laya could not load (measures the heuristic fallback)",
+    )
+
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -56,6 +71,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return asyncio.run(_doctor(cfg))
+
+    if args.command == "bench":
+        from .bench import bench
+
+        if args.page_text_chars is not None:
+            cfg.decider.page_text_chars = args.page_text_chars
+        if args.model:
+            cfg.llm.model = args.model
+        return bench(
+            cfg, repeat=args.repeat, out=args.out, headless=not args.show,
+            allow_degraded=args.allow_degraded,
+        )
 
     if args.host:
         cfg.server.host = args.host
