@@ -595,7 +595,9 @@ class Agent:
             self.goal, obs, candidates, self._history, note, obs.annotated_png if self.cfg.llm.vision else None
         )
         found = list(decision.notes)
-        if decision.seen:
+        # A blank tab has nothing worth remembering, and "the page is blank"
+        # was the first line of every run's notes.
+        if decision.seen and obs.url not in ("", "about:blank"):
             where = (obs.title or urlsplit(obs.url).path or obs.url)[:50]
             found.insert(0, f"[{where}] {decision.seen}")
         added = self._remember(found)

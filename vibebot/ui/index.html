@@ -117,6 +117,7 @@
   #found .r-head { font: 600 11px/1 inherit; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
   #found ul { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.45; }
   #found li.new { color: #9be7c4; }
+  #found .r-hint { font-size: 11px; color: var(--muted); margin: -2px 0 6px; }
   footer { padding: 8px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); } }
   @media (max-width: 760px) {
@@ -167,7 +168,8 @@
       <div class="r-answer" id="r-answer"></div>
     </div>
     <div id="found">
-      <div class="r-head">found so far</div>
+      <div class="r-head">its working notes</div>
+      <div class="r-hint">what the model wrote down as it went - its own words, not checked, and sometimes wrong</div>
       <ul id="found-list"></ul>
     </div>
     <div id="feed"></div>
