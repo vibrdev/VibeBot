@@ -32,6 +32,7 @@ Reply with ONE JSON object and nothing else:
 
 {
   "seen": "<what on THIS page matters for the goal: names, prices, counts, which filters are on>",
+  "plan": ["<the next steps AFTER this one, short, one action each - at least two unless the next step is answering>"],
   "op": "click|type|select|scroll|navigate|back|wait|extract|switch_tab|close_tab|ask_user|done|fail",
   "element_idx": <a [number] from PAGE, or null>,
   "text": "<text to type / option to select / url / tab number / question / final answer>",
@@ -41,6 +42,19 @@ Reply with ONE JSON object and nothing else:
 }
 
 Always fill in "seen" first - look before you act. It is saved to NOTES for you.
+Then always fill in "plan": every step you plan is one you are not called for.
+
+"plan" is handed to a fast helper that carries the steps out without asking
+you, so write each step so it can be done by clicking or typing one visible
+thing, and put the exact label in quotes:
+  "type 'macbook pro' into the search box"
+  "click 'Used'"
+  "click 'Price: lowest first'"
+  "click 'Next page'"
+  "read the page and answer"
+Make the last step "read the page and answer" when the answer should then be
+visible. You are called back if a step cannot be done, fails, or when it is
+time to read and answer.
 
 How to work:
 - Read PAGE first. The answer, or the control you need, is often already on it.
@@ -94,6 +108,10 @@ class LLMAction:
     notes: list[str] = field(default_factory=list)
     """Facts the model asked to keep. The agent carries them from page to page;
     without them it could not compare a listing on page 1 with one on page 3."""
+    plan: list[str] = field(default_factory=list)
+    """The steps after this one, for the fast decider to carry out. This is
+    the system-1/system-2 split: the LLM decides what to do, rarely; Laya or
+    Jev does it, one narrow "which element is this?" question at a time."""
     seen: str = ""
     """What the model says this page shows, written before it picks an action.
 
@@ -185,6 +203,9 @@ def render_prompt(
         lines += [f"  {tab.label()}" for tab in obs.tabs]
     lines += ["", "NOTES:"]
     lines += [f"  - {item}" for item in obs.memory] or ["  (nothing saved yet)"]
+    if obs.plan:
+        lines += ["", "YOUR PLAN (steps not done yet):"]
+        lines += [f"  {i + 1}. {item}" for i, item in enumerate(obs.plan)]
     if obs.page_text and NO_RESULTS.search(obs.page_text):
         lines += ["", _no_results_alert(obs)]
     if obs.page_text:
@@ -236,6 +257,7 @@ def parse_action(content: str) -> LLMAction:
         raw=text[:2000],
         notes=_as_notes(data.get("notes", data.get("note", data.get("remember")))),
         seen=" ".join(str(data.get("seen") or data.get("observation") or "").split())[:400],
+        plan=_as_notes(data.get("plan", data.get("next_steps"))),
     )
 
 

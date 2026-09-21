@@ -130,8 +130,8 @@ class Report:
         }
 
 
-def _read_trace(path: str) -> tuple[int, float, int]:
-    """(steps, laya share, llm calls) out of the run's own log."""
+def _read_trace(path: str, backend: str = "laya") -> tuple[int, float, int]:
+    """(steps, fast-decider share, llm calls) out of the run's own log."""
     steps = laya = calls = 0
     try:
         for line in Path(path).read_text(encoding="utf-8").splitlines():
@@ -144,7 +144,7 @@ def _read_trace(path: str) -> tuple[int, float, int]:
             # once reported a healthy 25% here.
             laya += (
                 (record.get("action") or {}).get("source") == "laya"
-                and (record.get("laya") or {}).get("backend") == "laya"
+                and (record.get("laya") or {}).get("backend") == backend
             )
             calls += len(record.get("llm_calls") or [])
     except Exception:  # noqa: BLE001 - a missing trace is not worth failing over
@@ -170,7 +170,7 @@ async def run_task(agent: Any, task: Task, base_url: str = "") -> Result:
     outcome = await agent.run(goal)
     elapsed = time.perf_counter() - started
 
-    steps, share, calls = _read_trace(outcome.get("trace", ""))
+    steps, share, calls = _read_trace(outcome.get("trace", ""), agent.cfg.decider.backend)
     summary = outcome.get("summary", "")
     return Result(
         task=task.name,
@@ -251,7 +251,7 @@ def bench(
         tasks = [t for t in tasks if any(name in t.name for name in only)]
     print(f"\nVibeBot benchmark - {suite} suite, {len(tasks)} goals"
           f"{f', {repeat} rounds' if repeat > 1 else ''}"
-          f"  (decider={cfg.decider.backend}, llm={cfg.llm.model},"
+          f"  (decider={cfg.decider.backend}/{cfg.decider.mode}, llm={cfg.llm.model},"
           f" reads {cfg.llm.page_chars} chars/page, num_ctx={cfg.llm.num_ctx})\n")
 
     site = None

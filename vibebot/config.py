@@ -46,22 +46,47 @@ class BrowserConfig:
 
 @dataclass
 class DeciderConfig:
-    backend: str = "off"
-    """off | laya | jev | heuristic. "off" means the LLM takes every step.
+    backend: str = "match"
+    """match | laya | jev | heuristic | off - the fast "system 1".
 
-    That is the default because of this, two rounds of the benchmark shop each,
-    same code, only this setting different:
+    In plan mode its one job is "which element is this plan step?". Measured
+    with `vibebot bench --executor` (20 steps on the benchmark shop, half in
+    the planner's wording, half paraphrased):
+
+                         planner wording        paraphrased          per step
+                         right  wrong  defer    right  wrong  defer
+        laya             4      4      2        0      8      2         3.2 s
+        match            10     0      0        1      0      9           0 ms
+
+    Zero-shot Laya is wrong more often than right, at high confidence, and the
+    order of the options changes its answer; a check with the options
+    reversed and shuffled ruled out position bias (it picked the first option
+    3/36 times) - it is drawn to "Search" whatever the step says. Label
+    matching is never wrong: it acts when a label matches and defers when not.
+    So it is the default, and `laya` / `jev` are one line away; run the exam
+    on anything you want to put in this slot before trusting it."""
+    mode: str = "plan"
+    """plan | gate - how the fast decider and the LLM share the work.
+
+    gate (the original design): the fast decider answers "which of these
+    elements should I act on next, for this goal?" every step, and the LLM
+    takes over when it is unsure. Measured on the benchmark shop, two rounds
+    each, against the LLM taking every step:
 
                       passed   median per goal   total    LLM calls
-        laya          7/10     144s              1469s    41
+        gate          7/10     144s              1469s    41
         off           7/10      57s               922s    47
 
-    Once the agent could read pages and stopped Laya undoing its own filters,
-    Laya no longer cost accuracy - but it did not buy speed either. It saved six
-    LLM calls in ten goals and added steps, because a confident wrong click
-    has to be walked back. It also holds ~2 GB and takes ~35s to warm up.
-    `laya` and `jev` still plug in exactly as before."""
-    """laya | jev | heuristic"""
+    Same accuracy, 2.5x slower: "what next, for this goal" is a planning
+    question, and a zero-shot classifier with no view of page state answered
+    it with confident wrong clicks (p=1.00 on "Deals", on the Eiffel Tower
+    logo, on the filter it had just switched on) that then had to be undone.
+
+    plan: the LLM, when called, acts and writes the next few steps as short
+    intents ("click 'Price: lowest first'"). The fast decider carries each one
+    out by answering a much narrower question - "which element is this?" -
+    over candidates ranked against the intent. The LLM is called again only
+    when a step cannot be matched, fails, or it is time to read and answer."""
     model: str = "auto"
     """auto (Laya Router), or an explicit repo id such as convaiinnovations/laya."""
     device: str = "cpu"
@@ -136,6 +161,7 @@ DECIDER_BACKENDS: dict[str, str] = {
     "laya": "laya",
     "jev": "jev",
     "heuristic": "heuristic",
+    "match": "match",  # plan-mode baseline: exact label matching, no model
 }
 
 #: Every accepted `llm.backend` value -> the implementation it selects.
@@ -318,6 +344,10 @@ class Config:
                 f"decider.backend: unknown value {self.decider.backend!r}. Valid values: {valid}"
             )
         self.decider.backend = DECIDER_BACKENDS[decider]
+        mode = str(self.decider.mode or "plan").strip().lower()
+        if mode not in {"plan", "gate"}:
+            raise ValueError(f"decider.mode: unknown value {self.decider.mode!r}. Valid values: gate, plan")
+        self.decider.mode = mode
 
         name = str(self.llm.backend or "ollama").strip().lower()
         if name not in LLM_BACKENDS:

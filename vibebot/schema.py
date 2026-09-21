@@ -83,6 +83,8 @@ class Observation:
     page_text_total: int = 0
     """How long page_text would have been with no budget, so a prompt can say
     how much it is not showing."""
+    plan: list[str] = field(default_factory=list)
+    """The LLM's remaining plan, shown back to it when it is called again."""
     memory: list[str] = field(default_factory=list)
     """Facts saved on earlier pages this run. Carried on the observation so
     every LLM backend sees them without its decide() signature changing."""

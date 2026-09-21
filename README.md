@@ -3,21 +3,20 @@
 A browser agent you run yourself. You give it a goal in your browser, it goes and
 does it — clicking, typing, navigating — and asks you when it gets stuck.
 
-How it works:
+The question behind it: **how much of a real browsing task can a fast, cheap
+"system 1" carry, with an LLM as "system 2" only for the heavier reasoning?**
+
+How a goal runs:
 
 | Part | What it is | What it does |
 |---|---|---|
 | **Reader** | the page in reading order, every element numbered inline | what the LLM sees - content first, menus last, active filters marked |
-| **LLM** | any local vision model via Ollama (`qwen3.5:4b` by default) | reads the page, decides each step, keeps notes of what it has found |
-| **Checks** | plain code | catches loops, undone filters, "nothing found" after a bad search, a count from page 1 of 3 |
+| **LLM** (system 2) | a local vision model via Ollama (`qwen3.5:4b`), or any OpenAI-compatible API | reads the page, acts, and writes a plan of the next few steps |
+| **Fast decider** (system 1) | `match` by default; `laya` or `jev` pluggable | carries the plan out, one "which element is this?" at a time, and hands back to the LLM when unsure |
+| **Checks** | plain code | loops, undone filters, "nothing found" after a bad search, a count from page 1 of 3 |
 | **You** | the human | asked before anything that buys, sends, signs in or consents |
 
-A fast pre-decider can sit in front of the LLM and take the obvious clicks:
-**Laya** (a 421M non-autoregressive model, local) or **Jev** (hosted). It is off
-by default, because measured on the test shop it did not pay for itself - same
-accuracy, about 2.5x slower per goal, because its confident wrong clicks had to
-be walked back. `decider.backend: laya` or `jev` turns it on; see
-"Measuring it" for the numbers.
+See "Can a fast decider carry the flow?" for what has been measured so far.
 
 Default install is 100% free and offline. Hosted decision engines (Jev) and
 hosted LLMs are supported but off by default.
@@ -131,6 +130,22 @@ VIBEBOT_SERVER_TOKEN=$(openssl rand -hex 16) \
 Put it behind a reverse proxy with TLS if it faces the internet.
 
 ## How a step works
+
+The default (`decider.mode: plan`):
+
+```
+observe page (reader)  ->  is there a plan step to do?
+   no, or the page no longer fits it  ->  LLM acts, and writes the next steps
+   yes, "read and answer"              ->  LLM
+   yes, a URL / scroll / back          ->  done directly, no model
+   yes, an element                     ->  fast decider: "which element is this?"
+                                            sure  -> act     unsure -> LLM
+```
+
+The rest of this section describes `decider.mode: gate`, the original design,
+where the fast decider picks every step for the whole goal. It is kept for
+comparison; see "Can a fast decider carry the flow?" for why it is not the
+default.
 
 ```
 observe page  ->  rank ~150 elements down to 12  ->  Laya answers 4 questions
@@ -321,18 +336,84 @@ The rows are also labelled training data — every step where Laya deferred and
 the LLM picked correctly is a fine-tuning example for making Laya handle *your*
 sites without the LLM.
 
+## Can a fast decider carry the flow?
+
+What has been measured, on the local benchmark shop (`vibebot bench`, two
+rounds each unless noted).
+
+**Asked "what should happen next, for this goal?" - no.** That was the
+original design (`decider.mode: gate`): Laya picks every step and the LLM
+steps in when it is unsure. It clicked "Deals", the Eiffel Tower logo, and
+the filter it had just switched on, all at p=1.00. That is a planning
+question, and a zero-shot classifier with no view of page state answers it
+confidently and wrongly.
+
+**So the job was split** (`decider.mode: plan`, the default). The LLM acts
+and writes the next steps as intents - "click 'Price: lowest first'" - and
+the fast decider only answers "which element is this step?" over candidates
+ranked against the step.
+
+**Zero-shot Laya cannot do that either.** `vibebot bench --executor` asks
+the question directly, 20 steps on real shop pages, half in the planner's
+wording and half paraphrased:
+
+| | planner wording: right / wrong / deferred | paraphrased: right / wrong / deferred | per step |
+|---|---|---|---|
+| `laya` | 4 / 4 / 2 | 0 / 8 / 2 | 3.2 s |
+| `match` (label matching, no model) | 10 / 0 / 0 | 1 / 0 / 9 | 0 ms |
+
+With the options reversed and shuffled, Laya picked the first-listed option
+3 times in 36 - chance, so not position bias. It is drawn to "Search"
+whatever the step says, and the same step with the options in a different
+order can get a different answer. Right in 12 of 36.
+
+**But the system-1 slot does work, filled with something reliable:**
+
+| setup | passed | total time | LLM calls | fast decider right when it acted |
+|---|---|---|---|---|
+| LLM decides every step | 8/10 | 1,011 s | 43 | - |
+| gate + Laya (earlier code) | 7/10 | 1,469 s | 41 | often wrong |
+| plan + Laya | 7/10 | 933 s | 38 | 3 of 11 |
+| plan + match | 7/10 | 959 s | 42 | 9 of 9 |
+| **plan + match, plan field first** | **8/10** | **772 s** | **35** | **8 of 8** |
+
+Same accuracy as the LLM alone, 24% less time, 19% fewer LLM calls.
+
+**What limits it now is the planner, not the executor.** Of 35 LLM calls in
+the last run, 24 were because no plan was left: `qwen3.5:4b` often writes no
+plan or a one-step one, so the fast decider only gets about one step in
+seven. A stronger planner (a bigger local model, or DeepSeek through the
+openai backend) should hand it more; nothing in the code needs to change to
+try that.
+
+**What would make a learned fast decider worth it** is the paraphrase
+column. `match` defers every step it cannot match by label; a model that got
+those right without being wrong elsewhere would take over steps the LLM does
+now. Zero-shot Laya does not. Fine-tuning it on the benchmark shop's steps
+and the traces is the obvious next experiment. To try Jev, or anything else,
+in that slot:
+
+```
+python -m vibebot bench --executor jev match     # the exam, about a minute
+python -m vibebot bench --decider jev --repeat 2 # the full suite
+```
+
 ## What the models actually see
 
 This is the part that decides whether a browser agent is any good, so it is
 worth being precise about.
 
-| | Laya | the LLM |
+| | fast decider (plan mode) | the LLM |
 |---|---|---|
-| page | title, URL, first `page_text_chars` (200) of raw text | the page in reading order, up to `llm.page_chars` (6,000) |
-| elements | the top 12 after ranking | every one, numbered inline where it sits on the page |
+| question | "which element is this plan step?" | the goal, and what to do next |
+| page | no page text - only the step | the page in reading order, up to `llm.page_chars` (6,000) |
+| elements | the top 12, ranked against the step | every one, numbered inline where it sits on the page |
 | state | none | what is selected, a loud note when a page shows no results |
 | memory | last 4 actions | everything it has written in `seen` and `notes`, on every step |
-| context | 512-1,024 tokens (built into Laya) | `llm.num_ctx` (8,192) |
+| context | 512-1,024 tokens for Laya | `llm.num_ctx` (8,192) |
+
+In `gate` mode the fast decider is asked about the whole goal instead, with
+the page title, URL and first `decider.page_text_chars` (200) of raw text.
 
 Until this version the LLM got twelve elements and the first 1,200 characters
 of the page. On a shop, the first 1,200 characters are the header, "Sign in"
@@ -369,6 +450,9 @@ benchmark:
 python -m vibebot bench                     # the test shop, once
 python -m vibebot bench --repeat 2          # two rounds - one is too noisy to trust
 python -m vibebot bench --llm-only          # the same, with no fast decider
+python -m vibebot bench --decider laya      # a different fast decider (match, laya, jev)
+python -m vibebot bench --mode gate         # the original design, for comparison
+python -m vibebot bench --executor laya match   # exam the fast decider alone
 python -m vibebot bench --suite web         # real websites, as a smoke test
 python -m vibebot bench --only seller --show
 python -m vibebot bench --model qwen3.5:9b --out after.json
