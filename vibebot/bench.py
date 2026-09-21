@@ -43,10 +43,36 @@ class Task:
         return bool(re.search(self.expect, summary or "", re.I))
 
 
-#: The default suite. Short goals with one checkable answer, on pages that do
-#: not move much. A goal whose answer changes daily cannot tell you whether a
-#: change to the agent helped.
-SUITE: list[Task] = [
+#: The default suite runs against vibebot.benchsite, served locally, so it
+#: measures the agent rather than the internet. "{base}" is its address.
+#: The shop goals are the product: compare listings, respect a condition, read
+#: past the first page, open an item for a detail. The wiki tower is fictional
+#: on purpose - a model can recite 1889 for the Eiffel Tower without reading a
+#: word, and a benchmark it can pass from memory measures nothing.
+SHOP_SUITE: list[Task] = [
+    Task("shop-cheapest-96",
+         "go to {base} and find the cheapest used MacBook Pro with at least 96GB of unified memory "
+         "and an M-series chip. Used condition only - not new, refurbished or for parts. "
+         "Report its price.",
+         r"21[ ,.]?450", 16),
+    Task("shop-count-128",
+         "go to {base} and find out how many MacBook listings in Used condition have exactly "
+         "128GB of memory",
+         r"\b(3|three)\b", 12),
+    Task("shop-seller",
+         "go to {base} and find who sells the cheapest refurbished MacBook with an M3 Max chip",
+         r"greenbyte", 12),
+    Task("shop-returns",
+         "go to {base} and find out how many days you have to return an item",
+         r"\b30\b", 8),
+    Task("wiki-tower",
+         "go to {base}/wiki/halvardsen-tower and find what year the Halvardsen Tower was completed",
+         r"\b1907\b", 6),
+]
+
+#: The real internet. Useful as a smoke test, useless for comparing changes:
+#: pages move, bot checks appear, and the model knows the answers already.
+WEB_SUITE: list[Task] = [
     Task("example-heading", "go to example.com and tell me the page heading", r"example domain", 6),
     Task("eiffel-year",
          "go to en.wikipedia.org and find what year the Eiffel Tower was completed", r"\b1889\b", 10),
@@ -57,6 +83,9 @@ SUITE: list[Task] = [
          "go to example.com and tell me which organisation the domain is reserved by",
          r"iana|internet assigned numbers", 8),
 ]
+
+SUITES: dict[str, list[Task]] = {"shop": SHOP_SUITE, "web": WEB_SUITE}
+SUITE = SHOP_SUITE  # the default
 
 
 @dataclass
@@ -123,8 +152,9 @@ def _read_trace(path: str) -> tuple[int, float, int]:
     return steps, (laya / steps if steps else 0.0), calls
 
 
-async def run_task(agent: Any, task: Task) -> Result:
+async def run_task(agent: Any, task: Task, base_url: str = "") -> Result:
     """One goal against an already-running agent."""
+    goal = task.goal.replace("{base}", base_url)
     agent.cfg.policy.max_steps = task.max_steps
     # Start each goal from one blank tab. The previous answer still on screen
     # lets the next task "solve" itself; a tab the previous goal opened sends
@@ -137,7 +167,7 @@ async def run_task(agent: Any, task: Task) -> Result:
     await agent.browser.goto("about:blank")
 
     started = time.perf_counter()
-    outcome = await agent.run(task.goal)
+    outcome = await agent.run(goal)
     elapsed = time.perf_counter() - started
 
     steps, share, calls = _read_trace(outcome.get("trace", ""))
@@ -156,7 +186,11 @@ async def run_task(agent: Any, task: Task) -> Result:
 
 
 async def run_suite(
-    cfg: Config, tasks: list[Task], repeat: int = 1, allow_degraded: bool = False
+    cfg: Config,
+    tasks: list[Task],
+    repeat: int = 1,
+    allow_degraded: bool = False,
+    base_url: str = "",
 ) -> Report:
     """All the goals against one agent.
 
@@ -192,7 +226,7 @@ async def run_suite(
             for task in tasks:
                 label = task.name if repeat == 1 else f"{task.name}#{round_number}"
                 print(f"  running {label} ...", flush=True)
-                result = await run_task(agent, task)
+                result = await run_task(agent, task, base_url)
                 result.task = label
                 report.results.append(result)
                 print(f"    {result.row()}", flush=True)
@@ -207,15 +241,31 @@ def bench(
     out: str | None = None,
     headless: bool = True,
     allow_degraded: bool = False,
+    suite: str = "shop",
+    only: list[str] | None = None,
 ) -> int:
     cfg.browser.headless = headless
     cfg.policy.autonomy = "normal"
-    print(f"\nVibeBot benchmark - {len(SUITE)} goals"
+    tasks = SUITES[suite]
+    if only:
+        tasks = [t for t in tasks if any(name in t.name for name in only)]
+    print(f"\nVibeBot benchmark - {suite} suite, {len(tasks)} goals"
           f"{f', {repeat} rounds' if repeat > 1 else ''}"
           f"  (decider={cfg.decider.backend}, llm={cfg.llm.model},"
-          f" page_text_chars={cfg.decider.page_text_chars})\n")
+          f" reads {cfg.llm.page_chars} chars/page, num_ctx={cfg.llm.num_ctx})\n")
 
-    report = asyncio.run(run_suite(cfg, SUITE, repeat, allow_degraded))
+    site = None
+    if suite == "shop":
+        from .benchsite import start
+
+        site = start()
+    try:
+        report = asyncio.run(
+            run_suite(cfg, tasks, repeat, allow_degraded, site.base_url if site else "")
+        )
+    finally:
+        if site:
+            site.stop()
 
     print("\n" + "-" * 104)
     for result in report.results:

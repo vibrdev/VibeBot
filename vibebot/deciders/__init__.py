@@ -14,15 +14,40 @@ __all__ = [
     "HeuristicDecider",
     "JevDecider",
     "LayaDecider",
+    "NoDecider",
     "Verdict",
     "build_decider",
 ]
+
+
+class NoDecider:
+    """No fast decider: the LLM takes every step.
+
+    Loads nothing, costs nothing, and always defers. See DeciderConfig.backend
+    for the measurements behind offering it.
+    """
+
+    name = "off"
+
+    def __init__(self, cfg: DeciderConfig):
+        self.cfg = cfg
+
+    def load(self) -> None:
+        return None
+
+    def available(self) -> bool:
+        return True
+
+    async def decide(self, goal, obs, candidates, history, text_options) -> Verdict:  # noqa: ANN001
+        return Verdict(target="ask_llm", backend="off")
 
 
 def build_decider(cfg: DeciderConfig):
     """Create the configured decider, falling back to the heuristic one if the
     real brain cannot be loaded (no torch, no network, bad repo id)."""
     backend = (cfg.backend or "laya").lower()
+    if backend in {"off", "none", "llm"}:
+        return NoDecider(cfg)
     if backend == "heuristic":
         decider = HeuristicDecider(cfg)
     elif backend == "jev":

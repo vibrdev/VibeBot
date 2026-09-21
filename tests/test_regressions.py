@@ -642,6 +642,11 @@ def test_the_llm_is_held_to_the_repeat_rule_once():
     agent.cfg = Config()
     agent.cfg.policy.autonomy = "yolo"
     agent._tried = {(_page_key(url), "click", 12)}
+    agent._challenged = False
+    agent._pages_checked = False
+    agent._incomplete_checked = False
+    agent._last_click = None
+    agent.goal = "find the year"
     asked: list[str] = []
 
     async def escalate(o, c, note):
@@ -708,3 +713,44 @@ def test_laya_does_not_switch_into_a_blank_tab():
 
     action, notes = resolve("https://www.iana.org/domains")
     assert action.op == "switch_tab" and action.text == "1"
+
+
+# ------------------------------------------------------ YAML's bare "off"
+
+def test_decider_backend_off_survives_yaml():
+    """`backend: off` parses as False under YAML 1.1. The factory read
+    `False or "laya"`, and a benchmark labelled "off" ran with Laya deciding
+    55% of its steps."""
+    import yaml
+
+    from vibebot.config import Config, _merge
+    from vibebot.deciders import build_decider
+
+    cfg = Config()
+    _merge(cfg, yaml.safe_load("decider:\n  backend: off\n"))
+    cfg._normalize()
+    assert cfg.decider.backend == "off"
+    assert build_decider(cfg.decider).name == "off"
+
+
+def test_llm_backend_off_does_not_become_ollama():
+    import yaml
+
+    from vibebot.config import Config, _merge
+
+    cfg = Config()
+    _merge(cfg, yaml.safe_load("llm:\n  backend: off\n"))
+    cfg._normalize()
+    assert cfg.llm.backend == "off"
+
+
+def test_an_unknown_decider_is_an_error_not_a_quiet_default():
+    import pytest
+    import yaml
+
+    from vibebot.config import Config, _merge
+
+    cfg = Config()
+    _merge(cfg, yaml.safe_load("decider:\n  backend: lyaa\n"))
+    with pytest.raises(ValueError, match="decider.backend"):
+        cfg._normalize()

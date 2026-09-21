@@ -17,7 +17,10 @@ browser:
                            # alone outweighs llm.max_tokens. Does NOT change memory.
 
 decider:
-  backend: laya            # laya | jev | heuristic
+  backend: off             # off | laya | jev | heuristic. off = the LLM takes every
+                           # step and nothing extra is loaded. Benchmarked, two rounds
+                           # each: off and laya both 7/10, but laya took 144s per goal
+                           # against 57s, and holds ~2 GB. Set laya or jev to compare.
   model: auto              # auto = Laya's Router; or convaiinnovations/laya[-multilingual]
   device: cpu              # cuda if you have a GPU
   preload: false           # true loads Laya's multilingual weights too (~2.5 GB of
@@ -57,6 +60,10 @@ llm:
   temperature: 0.1
   timeout_s: 180
   max_tokens: 1024
+  page_chars: 6000         # how much of the page the LLM reads per step, in reading
+                           # order with menus last (was: first 1200 chars of raw text)
+  num_ctx: 8192            # Ollama context window. Its default 4096 is too small for
+                           # the page + screenshot; 8192 measured at +197 MB.
   keep_alive: 5m           # how long Ollama keeps the model resident between calls.
                            # It holds ~5.7 GB of commit while loaded; VibeBot always
                            # releases it when a run ends. "30s" or "0" frees it sooner
