@@ -55,6 +55,11 @@ def main(argv: list[str] | None = None) -> int:
         help="never let the fast decider act, to measure what it is worth",
     )
     bench_cmd.add_argument("--mode", choices=["plan", "gate"], help="override decider.mode")
+    bench_cmd.add_argument("--think", choices=["on", "off", "auto"], help="override llm.think")
+    bench_cmd.add_argument("--max-tokens", type=int, help="override llm.max_tokens")
+    bench_cmd.add_argument("--num-ctx", type=int, help="override llm.num_ctx")
+    bench_cmd.add_argument("--llm-backend", help="override llm.backend (ollama, openai)")
+    bench_cmd.add_argument("--base-url", help="override llm.base_url")
     bench_cmd.add_argument(
         "--executor", nargs="*", metavar="BACKEND",
         help="exam the fast decider on plan steps instead (default: laya match)",
@@ -100,6 +105,16 @@ def main(argv: list[str] | None = None) -> int:
             cfg.decider.mode = args.mode
         if args.decider:
             cfg.decider.backend = args.decider
+        if args.think:
+            cfg.llm.think = args.think
+        if args.max_tokens:
+            cfg.llm.max_tokens = args.max_tokens
+        if args.num_ctx:
+            cfg.llm.num_ctx = args.num_ctx
+        if args.llm_backend:
+            cfg.llm.backend = args.llm_backend
+        if args.base_url is not None:
+            cfg.llm.base_url = args.base_url
         cfg._normalize()  # validate the overrides the same way as the file
         if args.executor is not None:
             from .execbench import executor_bench

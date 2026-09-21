@@ -58,7 +58,11 @@ SHOP_SUITE: list[Task] = [
     Task("shop-count-128",
          "go to {base} and find out how many MacBook listings in Used condition have exactly "
          "128GB of memory",
-         r"\b(3|three)\b", 12),
+         # The 3 must be the count. A plain \b3\b passed "There is 1 listing ...
+         # this is page 3 of 3 ... the total count is 1".
+         r"^\W*(?:3|three)\W*$"
+         r"|\b(?:3|three)\s+(?:[A-Za-z0-9]+\s+){0,4}?(?:listings?|macbooks?|results?|items?|matches|ones)\b"
+         r"|\b(?:count|total|number)\b[^.\d]{0,20}\b(?:3|three)\b", 12),
     Task("shop-seller",
          "go to {base} and find who sells the cheapest refurbished MacBook with an M3 Max chip",
          r"greenbyte", 12),
@@ -251,7 +255,8 @@ def bench(
         tasks = [t for t in tasks if any(name in t.name for name in only)]
     print(f"\nVibeBot benchmark - {suite} suite, {len(tasks)} goals"
           f"{f', {repeat} rounds' if repeat > 1 else ''}"
-          f"  (decider={cfg.decider.backend}/{cfg.decider.mode}, llm={cfg.llm.model},"
+          f"  (decider={cfg.decider.backend}/{cfg.decider.mode}, llm={cfg.llm.backend}:{cfg.llm.model}"
+          f" think={cfg.llm.think} max_tokens={cfg.llm.max_tokens},"
           f" reads {cfg.llm.page_chars} chars/page, num_ctx={cfg.llm.num_ctx})\n")
 
     site = None
